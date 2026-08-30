@@ -1,0 +1,5 @@
+dist/
+*.pem
+*.key
+.idea/
+.vscode/
