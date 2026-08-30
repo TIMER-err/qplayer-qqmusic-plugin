@@ -4,20 +4,58 @@ on:
   push:
     branches:
       - '**'
+    tags:
+      - 'v*'
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(python3 -c 'import json; print(json.load(open("plugin.json"))["version"])')
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Prepare publisher key
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          PUBLISHER_PRIVATE_KEY: ${{ secrets.QPLAYER_PLUGIN_SIGNING_KEY }}
+        run: |
+          test -n "$PUBLISHER_PRIVATE_KEY"
+          key_file="$RUNNER_TEMP/qplayer-plugin-publisher.pem"
+          printf '%s\n' "$PUBLISHER_PRIVATE_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          echo "QPLAYER_PLUGIN_SIGNING_KEY=$key_file" >> "$GITHUB_ENV"
+      - name: Match the pinned publisher key
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          actual=$(openssl ec -in "$QPLAYER_PLUGIN_SIGNING_KEY" -pubout -outform DER \
+            | openssl base64 -A)
+          expected=$(tr -d '\r\n' < publisher-key.pub)
+          if [ "$actual" != "$expected" ]; then
+            echo "signing key does not match publisher-key.pub" >&2
+            exit 1
+          fi
       - name: Check JavaScript syntax
         run: find src -name '*.js' -print0 | xargs -0 -n1 node --check
       - name: Build plugin package
         run: ./scripts/package.sh
       - name: Verify package contents
         run: python3 scripts/verify-package.py dist/*.qplug
+      - name: Require publisher signature
+        if: startsWith(github.ref, 'refs/tags/')
+        run: unzip -Z1 dist/*.qplug | grep -Fx META-INF/qplayer.sig
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          gh release create "$GITHUB_REF_NAME" dist/*.qplug \
+            --verify-tag --generate-notes --title "QQ 音乐音源插件 $version"

@@ -28,6 +28,10 @@ QPLAYER_PLUGIN_SIGNING_KEY=/secure/path/publisher-private.pem ./scripts/package.
 
 随后在 QPlayer 的“设置 → 音源插件”中导入生成的 `.qplug`。
 
+正式版本由 GitHub Actions 在推送与 `plugin.json` 版本一致的 `v<version>` tag
+时自动签名、校验并发布。`publisher-key.pub` 是 QPlayer 官方音源列表固定的
+发布者公钥，不得随意更换；发布私钥只保存在维护者的离线备份和仓库 Secret 中。
+
 ## 登录(播放必需)
 
 QQ 音乐客户端或网页登录后，抓取 `qqmusic.music.qq.com` 请求头中的 Cookie，
