@@ -111,9 +111,13 @@ function musicu(entries) {
 // ---- DTO (宿主兼容字段,同 netease 插件) -----------------------------------
 
 function artistsOf(list) {
-  return (list || []).map(function (item) {
-    return { id: String(item.mid || item.id || ""), name: item.name || "" };
+  var out = [];
+  (list || []).forEach(function (item) {
+    var id = String((item && (item.mid || item.id)) || "");
+    // 宿主的 MediaId 拒绝空 nativeId 并抛异常,会连带打挂整条结果,所以这里先滤掉。
+    if (id) out.push({ id: id, name: (item && item.name) || "" });
   });
+  return out;
 }
 
 function songDto(raw) {
@@ -130,6 +134,41 @@ function songDto(raw) {
       ? "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + raw.albummid + ".jpg"
       : (album.pmid ? "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + album.pmid + ".jpg" : "")),
     playable: true, trial: false
+  };
+}
+
+/** QQ 的图片 mid 有两种形态:裸 mid 和带版本后缀的 pmid,两者都能取到图。 */
+function photoUrl(prefix, id) {
+  return id ? "https://y.gtimg.cn/music/photo_new/" + prefix + "R300x300M000" + id + ".jpg" : "";
+}
+
+/** "2003-07-31" → epoch ms;解析不出来就返回 0,由宿主当作未知发行日期。 */
+function publishMs(text) {
+  var parts = String(text || "").split("-");
+  if (parts.length < 3) return 0;
+  var year = Number(parts[0]), month = Number(parts[1]), day = Number(parts[2]);
+  if (!year || !month || !day) return 0;
+  return Date.UTC(year, month - 1, day);
+}
+
+/** 兼容 GetAlbumList 的扁平条目与 GetAlbumDetail 的 basicInfo。 */
+function albumDto(raw, songs) {
+  raw = raw || {};
+  var mid = raw.albumMid || raw.mid || "";
+  // GetAlbumList 只给 singerName、不给 mid,而宿主要求 artist id 非空,
+  // 所以退回用首曲的歌手(带 mid)来标注专辑归属。
+  var artists = raw.singerMid && raw.singerName
+    ? [{ id: String(raw.singerMid), name: raw.singerName }]
+    : ((songs && songs[0] && songs[0].artists) || []);
+  return {
+    id: String(mid),
+    name: raw.albumName || raw.name || "",
+    artworkUrl: secureUrl(photoUrl("T002", raw.pmid || mid)),
+    publishTimeMs: publishMs(raw.publishDate),
+    description: raw.desc || "",
+    trackCount: Number(raw.totalNum || (songs || []).length || 0),
+    artists: artists,
+    songs: songs || []
   };
 }
 
@@ -194,6 +233,75 @@ function home(args) {
     var data = body.recomPlaylist && body.recomPlaylist.data || {};
     var list = (data.v_hot || []).map(playlistDto);
     return { songs: [], playlists: list.slice(0, Number(args.limit || 12)) };
+  });
+}
+
+function artistDetails(args) {
+  var mid = String(args.id || "");
+  if (!mid) throw new Error("缺少歌手 ID");
+  var limit = Math.min(100, Math.max(1, Number(args.limit || 50)));
+  return musicu({
+    info: {
+      module: "music.musichallSinger.SingerInfoInter",
+      method: "GetSingerDetail",
+      param: { singer_mids: [mid], pic: 1, group_singer: 1, wiki_singer: 1, ex_singer: 1 }
+    },
+    songs: {
+      module: "musichall.song_list_server",
+      method: "GetSingerSongList",
+      param: { singerMid: mid, begin: 0, num: limit, order: 1 }
+    },
+    albums: {
+      module: "music.musichallAlbum.AlbumListServer",
+      method: "GetAlbumList",
+      param: { singerMid: mid, begin: 0, num: limit, order: 1 }
+    }
+  }).then(function (body) {
+    var singer = ((body.info && body.info.data || {}).singer_list || [])[0] || {};
+    var basic = singer.basic_info || {};
+    var extra = singer.ex_info || {};
+    var songData = body.songs && body.songs.data || {};
+    var albumData = body.albums && body.albums.data || {};
+    var songs = (songData.songList || []).map(function (row) {
+      return songDto((row || {}).songInfo);
+    });
+    var albums = (albumData.albumList || []).map(function (row) { return albumDto(row, null); });
+    return {
+      id: mid,
+      name: basic.name || "",
+      artworkUrl: secureUrl(photoUrl("T001", basic.singer_pmid || mid)),
+      description: extra.desc || "",
+      albumCount: Number(albumData.total || albums.length || 0),
+      songCount: Number(songData.totalNum || songs.length || 0),
+      songs: songs,
+      albums: albums
+    };
+  });
+}
+
+function albumDetails(args) {
+  var mid = String(args.id || "");
+  if (!mid) throw new Error("缺少专辑 ID");
+  return musicu({
+    info: {
+      module: "music.musichallAlbum.AlbumInfoServer",
+      method: "GetAlbumDetail",
+      param: { albumMid: mid }
+    },
+    songs: {
+      module: "music.musichallAlbum.AlbumSongList",
+      method: "GetAlbumSongList",
+      param: { albumMid: mid, begin: 0, num: 100, order: 1 }
+    }
+  }).then(function (body) {
+    var basic = (body.info && body.info.data || {}).basicInfo || {};
+    var songData = body.songs && body.songs.data || {};
+    var songs = (songData.songList || []).map(function (row) {
+      return songDto((row || {}).songInfo);
+    });
+    if (!basic.albumMid) basic.albumMid = mid;
+    if (!basic.totalNum) basic.totalNum = songData.totalNum;
+    return albumDto(basic, songs);
   });
 }
 
@@ -310,6 +418,8 @@ module.exports = {
   handlers: {
     searchSongs: searchSongs,
     songDetails: songDetails,
+    artistDetails: artistDetails,
+    albumDetails: albumDetails,
     home: home,
     resolveStream: resolveStream,
     lyrics: lyrics,

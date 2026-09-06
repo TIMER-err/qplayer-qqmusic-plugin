@@ -10,6 +10,8 @@
   "capabilities": [
     "searchSongs",
     "songDetails",
+    "artistDetails",
+    "albumDetails",
     "home",
     "resolveStream",
     "lyrics",
