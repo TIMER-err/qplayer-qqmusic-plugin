@@ -202,20 +202,26 @@ function resolveStream(args) {
   if (!mid) throw new Error("缺少歌曲 ID");
   var guid = String(Math.floor(1000000000 + Math.random() * 9000000000));
   var filenames = ["M800" + mid + mid + ".mp3", "M500" + mid + mid + ".mp3"];
-  return musicu({
-    req_1: {
-      module: "music.vkey.GetVkey",
-      method: "UrlGetVkey",
-      param: {
-        guid: guid, songmid: [mid, mid], songtype: [0, 0],
-        uin: "0", loginflag: 1, platform: "20", filename: filenames
+  return loadCookies().then(function (cookies) {
+    // 登录态下 param.uin 必须是真实 uin;写死 "0" 会让 vkey 服务按匿名处理,
+    // 于是连会员歌也拿不到 purl。
+    var uin = musicKey(cookies) ? musicUin(cookies) : "0";
+    return musicu({
+      req_1: {
+        module: "music.vkey.GetVkey",
+        method: "UrlGetVkey",
+        param: {
+          guid: guid, songmid: [mid, mid], songtype: [0, 0],
+          uin: uin, loginflag: 1, platform: "20", filename: filenames
+        }
       }
-    }
+    });
   }).then(function (body) {
     var data = body.req_1 && body.req_1.data || {};
+    // 不要用 data.sip:它目前恒为 aqqmusic.tc.qq.com,不在 plugin.json 的
+    // networkDomains 里,宿主会以 "stream URL outside its grant" 拒收整首歌。
+    // 各 CDN 主机对同一个 purl 可互换,固定用已声明的 STREAM_HOST 即可。
     var host = STREAM_HOST;
-    var sip = data.sip || [];
-    if (sip.length) host = secureUrl(sip[0]);
     var infos = data.midurlinfo || [];
     for (var i = 0; i < filenames.length; i++) {
       for (var j = 0; j < infos.length; j++) {
