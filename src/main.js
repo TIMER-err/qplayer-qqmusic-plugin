@@ -342,10 +342,17 @@ function resolveStream(args) {
         }
       }
     }
-    return loadCookies().then(function (cookies) {
-      throw new Error(musicKey(cookies)
-        ? "歌曲暂无可用播放地址(可能是 VIP 歌曲或无版权)"
-        : "需要登录:请到设置 → QQ音乐 → 登录(粘贴 QQ 音乐 Cookie)后播放");
+    // 官方拿不到 purl(会员歌/无版权/未登录)时先试音源解锁,它关掉或没命中才报错。
+    return unblock.resolve({
+      songId: mid,
+      songDetails: function () { return songDetails({ ids: [mid] }); }
+    }).then(function (stream) {
+      if (stream) return stream;
+      return loadCookies().then(function (cookies) {
+        throw new Error(musicKey(cookies)
+          ? "歌曲暂无可用播放地址(可能是 VIP 歌曲或无版权)"
+          : "需要登录:请到设置 → QQ音乐 → 登录(粘贴 QQ 音乐 Cookie)后播放");
+      });
     });
   });
 }
@@ -414,6 +421,8 @@ function login(args) {
   }
 }
 
+var unblock = require("./unblock");
+
 module.exports = {
   handlers: {
     searchSongs: searchSongs,
@@ -424,6 +433,7 @@ module.exports = {
     resolveStream: resolveStream,
     lyrics: lyrics,
     account: account,
-    login: login
+    login: login,
+    "ui.unblock": unblock.ui
   }
 };

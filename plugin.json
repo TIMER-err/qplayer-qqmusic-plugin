@@ -20,18 +20,35 @@
   ],
   "permissions": [
     "network",
-    "credentials"
+    "clearTextNetwork",
+    "credentials",
+    "notifications",
+    "customUi"
   ],
   "networkDomains": [
     "c.y.qq.com",
     "u.y.qq.com",
     "ws.stream.qqmusic.qq.com",
     "y.gtimg.cn",
-    "*.gtimg.cn"
+    "*.gtimg.cn",
+    "music-api.gdstudio.xyz",
+    "search.kuwo.cn",
+    "mobi.kuwo.cn",
+    "bd-api.kuwo.cn",
+    "*.kuwo.cn",
+    "music.126.net",
+    "*.music.126.net"
   ],
   "networkMethods": [
     "GET",
     "POST"
   ],
-  "ui": []
+  "ui": [
+    {
+      "id": "unblock",
+      "placement": "settings",
+      "label": "音源解锁",
+      "icon": "lock_open"
+    }
+  ]
 }
