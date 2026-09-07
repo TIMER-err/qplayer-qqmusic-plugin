@@ -12,6 +12,14 @@ var STREAM_HOST = "https://ws.stream.qqmusic.qq.com/";
 var REF_SEARCH = "https://y.qq.com/portal/search.html";
 var REF_BASE = "https://y.qq.com/";
 var REF_LYRIC = "https://y.qq.com/portal/player.html";
+// 微信扫码登录。QQ 号那条路(ptqrshow)用不了:它返回的是 PNG,二维码里编的
+// http://txz.qq.com/p?k=<服务端令牌> 只存在于图像内,响应头和 cookie 都拿不到,
+// 而宿主是拿 qrContent 字符串自己 QrMatrix.encode 出二维码的。
+var WX_APPID = "wx48db31d50e334801";
+var WX_QRCONNECT = "https://open.weixin.qq.com/connect/qrconnect";
+var WX_POLL = "https://lp.open.weixin.qq.com/connect/l/qrconnect";
+var WX_CONFIRM = "https://open.weixin.qq.com/connect/confirm?uuid=";
+var REF_WX = "https://open.weixin.qq.com/";
 var qrcDecrypt = require("./qrc").qrcDecrypt;
 
 function call(method, args) { return qplayer.call(method, args || {}); }
@@ -27,6 +35,33 @@ function loadCookies() {
   return call("credentials.get", { key: "cookies" }).then(function (stored) {
     if (!stored) return {};
     try { return JSON.parse(stored); } catch (_) { return {}; }
+  });
+}
+
+/**
+ * 扫码登录拿到的是一份凭据对象而不是 cookie。它必须跟 "cookies" 分开存:
+ * musicu() 会把 "cookies" 里的每个键都拼进 Cookie 请求头,
+ * refresh_token/loginType 这类字段混进去会污染请求。
+ */
+function loadSession() {
+  return call("credentials.get", { key: "session" }).then(function (stored) {
+    if (!stored) return {};
+    try { return JSON.parse(stored); } catch (_) { return {}; }
+  }, function () { return {}; });
+}
+
+function saveSession(value) {
+  return call("credentials.put", { key: "session", value: JSON.stringify(value) });
+}
+
+function httpGetText(url, referer, ua, timeoutMs) {
+  return call("http.request", {
+    url: url, method: "GET",
+    headers: { "User-Agent": ua || UA_PC, "Referer": referer || REF_BASE },
+    timeoutMs: timeoutMs || 15000
+  }).then(function (response) {
+    if (response.status < 200 || response.status >= 300) throw new Error("HTTP " + response.status);
+    return String(response.body || "");
   });
 }
 
@@ -85,7 +120,9 @@ function httpPostJson(url, body, referer, headers) {
 
 /** musicu.fcg 批量请求;带登录 cookie 时使用真实 uin 与 musickey。 */
 function musicu(entries) {
-  return loadCookies().then(function (cookies) {
+  return Promise.all([loadCookies(), loadSession()]).then(function (both) {
+    var cookies = both[0];
+    var session = both[1] || {};
     var key = musicKey(cookies);
     var uin = key ? musicUin(cookies) : "0";
     var gtkValue = gtk(key);
@@ -94,6 +131,13 @@ function musicu(entries) {
       notice: 0, platform: "yqq.json", needNewCode: 1, uin: uin,
       g_tk: gtkValue, g_tk_new_20200303: gtkValue
     };
+    // 扫码登录的 musickey 要靠 authst + tmeLoginType 才被认;loginType 用服务端
+    // 在 Login 响应里回的值,不写死(各家参考实现对这个编号的说法互相矛盾)。
+    // 粘贴 Cookie 那条路不带这两个字段,保持原有行为不变。
+    if (key && session.loginType) {
+      comm.authst = key;
+      comm.tmeLoginType = session.loginType;
+    }
     var body = { comm: comm };
     Object.keys(entries).forEach(function (k) { body[k] = entries[k]; });
     var headers = null;
@@ -371,14 +415,73 @@ function lyrics(args) {
 }
 
 function account() {
-  return loadCookies().then(function (cookies) {
+  return Promise.all([loadCookies(), loadSession()]).then(function (both) {
+    var cookies = both[0];
+    var session = both[1] || {};
     var uin = musicUin(cookies);
     var key = musicKey(cookies);
     if (!key || uin === "0") return { loggedIn: false };
     return {
-      loggedIn: true, id: uin, displayName: "QQ " + uin,
-      avatarUrl: "", membershipTier: 0, level: 0, signature: ""
+      loggedIn: true, id: uin,
+      displayName: session.nick || ("QQ " + uin),
+      avatarUrl: session.logo || "",
+      membershipTier: 0, level: 0, signature: ""
     };
+  });
+}
+
+/** 从微信登录页里取出本次会话的 uuid。 */
+function wxBeginChallenge() {
+  var query = "appid=" + WX_APPID
+    + "&redirect_uri=" + encodeURIComponent("https://y.qq.com/portal/wx_redirect.html?login_type=2&surl=https://y.qq.com/")
+    + "&response_type=code&scope=snsapi_login&state=STATE"
+    + "&href=" + encodeURIComponent("https://y.qq.com/mediastyle/music_v17/src/css/popup_wechat.css#wechat_redirect");
+  return httpGetText(WX_QRCONNECT + "?" + query, REF_WX, UA_PC).then(function (html) {
+    var match = /uuid=([A-Za-z0-9_-]+)/.exec(html);
+    if (!match) throw new Error("未能获取微信登录二维码");
+    var uuid = match[1];
+    return {
+      id: uuid, methodId: "wxqr", status: "waiting",
+      // 实测微信二维码图片编的就是这个串,所以宿主自己 encode 出来的码可以直接扫。
+      qrContent: WX_CONFIRM + uuid,
+      expiresAtMs: Date.now() + 5 * 60 * 1000
+    };
+  });
+}
+
+/** 用扫码换来的 code 换取 musickey,并落库成 cookie 形态 + 独立会话。 */
+function wxAuthorize(code) {
+  return httpPostJson(MUSICU, {
+    comm: { tmeLoginType: 1, format: "json", inCharset: "utf-8", outCharset: "utf-8" },
+    req_1: {
+      module: "music.login.LoginServer", method: "Login",
+      param: { code: code, strAppid: WX_APPID }
+    }
+  }, REF_BASE).then(function (body) {
+    var data = body.req_1 && body.req_1.data || {};
+    var key = String(data.musickey || "");
+    var id = String(data.musicid || data.str_musicid || data.uin || "");
+    if (!key || !id) throw new Error("微信登录未返回有效凭据");
+    // "cookies" 只放 cookie 形态的字段 —— musicu() 会把它整份拼进 Cookie 头。
+    var cookies = {
+      uin: id, musicid: id, musickey: key, qqmusic_key: key, qm_keyst: key
+    };
+    var session = {
+      loginType: Number(data.loginType || 1),
+      refreshToken: String(data.refresh_token || ""),
+      unionid: String(data.unionid || ""),
+      nick: String(data.nick || data.nickname || ""),
+      logo: String(data.logo || data.headurl || "")
+    };
+    return call("credentials.put", { key: "cookies", value: JSON.stringify(cookies) })
+      .then(function () { return saveSession(session); })
+      .then(function () {
+        return {
+          loggedIn: true, id: id,
+          displayName: session.nick || ("QQ " + id),
+          avatarUrl: session.logo, membershipTier: 0, level: 0, signature: ""
+        };
+      });
   });
 }
 
@@ -386,11 +489,42 @@ function login(args) {
   switch (args.operation) {
     case "methods":
       return [{
+        id: "wxqr", type: "qr", label: "微信扫码",
+        instructions: "用微信扫码并确认，即可登录绑定了该微信的 QQ 音乐账号。"
+      }, {
         id: "cookie", type: "credential", label: "Cookie",
         instructions: "在 QQ 音乐客户端/网页登录后,复制含 musickey 的 Cookie(如抓包 qqmusic.music.qq.com 请求头)。" +
           "插件会提取 musickey 与 uin 并加密保存,用于 Vkey 播放。",
         credentialLabel: "QQ 音乐 Cookie"
       }];
+    case "begin":
+      if (args.methodId !== "wxqr") throw new Error("该登录方式不需要创建挑战");
+      return wxBeginChallenge();
+    case "poll": {
+      var uuid = String(args.challengeId || "");
+      if (!uuid) throw new Error("缺少登录挑战 ID");
+      var waiting = { id: uuid, methodId: "wxqr", status: "waiting" };
+      // 这是长轮询,未扫码时服务端会挂住约 15 秒才回 408;超时/网络抖动都按
+      // "还在等" 处理,不能报失败,否则界面会在正常等待期间弹错。
+      return httpGetText(WX_POLL + "?uuid=" + encodeURIComponent(uuid) + "&_=" + Date.now(),
+          REF_WX, UA_PC, 25000).then(function (text) {
+        var match = /window\.wx_errcode=(\d+);window\.wx_code='([^']*)'/.exec(text);
+        if (!match) return waiting;
+        var code = Number(match[1]);
+        var wxCode = match[2];
+        if (code === 404) return { id: uuid, methodId: "wxqr", status: "scanned" };
+        if (code === 402 || code === 403) return { id: uuid, methodId: "wxqr", status: "expired" };
+        if (code === 405 && wxCode) {
+          return wxAuthorize(wxCode).then(function (profile) {
+            return { id: uuid, methodId: "wxqr", status: "success", account: profile };
+          }, function (error) {
+            return { id: uuid, methodId: "wxqr", status: "failed",
+              message: String(error && error.message || error) };
+          });
+        }
+        return waiting;
+      }, function () { return waiting; });
+    }
     case "submit": {
       var cookieStr = String(args.credential || "");
       if (!cookieStr) return { methodId: args.methodId, status: "failed", message: "Cookie 为空" };
@@ -415,7 +549,10 @@ function login(args) {
       });
     }
     case "logout":
-      return call("credentials.delete", { key: "cookies" }).then(function () { return true; });
+      return call("credentials.delete", { key: "cookies" })
+        .then(function () { return call("credentials.delete", { key: "session" }); },
+              function () { return call("credentials.delete", { key: "session" }); })
+        .then(function () { return true; }, function () { return true; });
     default:
       throw new Error("未知登录操作");
   }
