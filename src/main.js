@@ -21,6 +21,11 @@ var WX_POLL = "https://lp.open.weixin.qq.com/connect/l/qrconnect";
 var WX_CONFIRM = "https://open.weixin.qq.com/connect/confirm?uuid=";
 var REF_WX = "https://open.weixin.qq.com/";
 var qrcDecrypt = require("./qrc").qrcDecrypt;
+// 账号自带的「我喜欢」歌单固定是 201 号目录,红心就是往它里面增删。
+var FAV_DIR_ID = 201;
+// 一次歌单详情最多取多少首:aiDissInfo 单页上限 1000,再多就分页续拉。
+var DISS_PAGE = 500;
+var MAX_PLAYLIST_SONGS = 3000;
 
 function call(method, args) { return qplayer.call(method, args || {}); }
 
@@ -118,8 +123,11 @@ function httpPostJson(url, body, referer, headers) {
   });
 }
 
+/** 写接口(收藏/歌单增删)只在 ct=26 下被受理:ct=24 会返回 80105/1101。 */
+var WRITE_COMM = { ct: 26, cv: 0, needNewCode: 0 };
+
 /** musicu.fcg 批量请求;带登录 cookie 时使用真实 uin 与 musickey。 */
-function musicu(entries) {
+function musicu(entries, override) {
   return Promise.all([loadCookies(), loadSession()]).then(function (both) {
     var cookies = both[0];
     var session = both[1] || {};
@@ -131,12 +139,15 @@ function musicu(entries) {
       notice: 0, platform: "yqq.json", needNewCode: 1, uin: uin,
       g_tk: gtkValue, g_tk_new_20200303: gtkValue
     };
+    if (override) Object.keys(override).forEach(function (k) { comm[k] = override[k]; });
     // 扫码登录的 musickey 要靠 authst + tmeLoginType 才被认;loginType 用服务端
     // 在 Login 响应里回的值,不写死(各家参考实现对这个编号的说法互相矛盾)。
-    // 粘贴 Cookie 那条路不带这两个字段,保持原有行为不变。
-    if (key && session.loginType) {
+    // 粘贴/网页登录拿到的 Cookie 自带 tmeLoginType,同样要带上,否则登录态只对
+    // 读接口生效,写接口一律被拒。
+    var loginType = Number(session.loginType || cookies.tmeLoginType || 0);
+    if (key && loginType) {
       comm.authst = key;
-      comm.tmeLoginType = session.loginType;
+      comm.tmeLoginType = loginType;
     }
     var body = { comm: comm };
     Object.keys(entries).forEach(function (k) { body[k] = entries[k]; });
@@ -164,10 +175,21 @@ function artistsOf(list) {
   return out;
 }
 
+/**
+ * 宿主的歌曲标识是 mid,而收藏/歌单写接口只认数字 songId。凡是解析过的歌曲都
+ * 顺手记下这层映射,红心一首刚播过的歌就不必再多一次 songDetails 往返。
+ */
+var numericIds = {};
+
+function rememberNumericId(mid, id) {
+  if (mid && id) numericIds[String(mid)] = Number(id);
+}
+
 function songDto(raw) {
   raw = raw || {};
   var album = raw.album || {};
   var mid = raw.songmid || raw.mid || "";
+  rememberNumericId(mid, raw.songid || raw.id);
   return {
     id: mid,
     title: raw.songname || raw.name || raw.title || "",
@@ -216,17 +238,84 @@ function albumDto(raw, songs) {
   };
 }
 
+/** 推荐位/搜索等只给概要的歌单条目。 */
 function playlistDto(raw) {
   raw = raw || {};
   return {
     id: String(raw.content_id || raw.tid || raw.id || ""),
     name: raw.title || raw.name || "",
     description: raw.desc || "",
-    artworkUrl: secureUrl(raw.cover || raw.picUrl || ""),
-    owner: null,
-    trackCount: Number(raw.song_cnt || raw.total_song_num || 0),
-    playCount: Number(raw.access_num || raw.play_count || 0),
+    artworkUrl: secureUrl(raw.cover || raw.picUrl || raw.logo || ""),
+    owner: ownerRef(raw.creator || raw.uin, raw.username || raw.nickname || raw.nick),
+    trackCount: Number(raw.song_cnt || raw.total_song_num || raw.songnum || raw.songNum || 0),
+    playCount: Number(raw.access_num || raw.play_count || raw.listen_num || 0),
     subscribed: false, owned: false
+  };
+}
+
+/**
+ * QQ 的 uin 有三种形态:数字、"o" 前缀的加密串和带 ** 的脱敏串。宿主要用它组
+ * 成 MediaId,只有纯数字是可用的,其余一律当作没有作者信息。
+ */
+function ownerRef(uin, name) {
+  var id = String(uin || "");
+  if (!/^[0-9]+$/.test(id) || id === "0") id = "";
+  var label = String(name || "");
+  return id || label ? { id: id, name: label } : null;
+}
+
+/** aiDissInfo 的 dirinfo(歌单详情页)。 */
+function dirinfoDto(dir, tid, songs) {
+  dir = dir || {};
+  var dirid = Number(dir.dirid || 0);
+  var owned = Number(dir.owndir || 0) === 1;
+  return {
+    id: String(tid),
+    name: dir.title || "",
+    description: dir.desc || "",
+    artworkUrl: secureUrl(dir.picurl || dir.picurl2 || ""),
+    owner: ownerRef(dir.host_uin, dir.host_nick),
+    trackCount: Number(dir.songnum || (songs || []).length || 0),
+    playCount: Number(dir.listennum || 0),
+    subscribed: !owned && dirid > 0,
+    owned: owned,
+    mutable: owned,
+    // 「我喜欢」是账号自带的固定歌单,删不掉。
+    deletable: owned && dirid !== FAV_DIR_ID,
+    songs: songs || []
+  };
+}
+
+/** GetPlaylistByUin 的自建歌单条目。 */
+function ownPlaylistDto(raw) {
+  raw = raw || {};
+  var dirid = Number(raw.dirId || 0);
+  return {
+    id: String(raw.tid || ""),
+    name: raw.dirName || "",
+    description: raw.desc || "",
+    artworkUrl: secureUrl(raw.picUrl || raw.bigpicUrl || raw.albumPicUrl || ""),
+    owner: ownerRef(raw.uin, raw.nick),
+    trackCount: Number(raw.songNum || 0),
+    playCount: Number(raw.play_cnt || 0),
+    subscribed: false, owned: true,
+    mutable: true, deletable: dirid !== FAV_DIR_ID
+  };
+}
+
+/** GetPlaylistFavInfo 的收藏歌单条目(作者是别人,只能取消收藏)。 */
+function favPlaylistDto(raw) {
+  raw = raw || {};
+  return {
+    id: String(raw.tid || ""),
+    name: raw.name || raw.dirName || "",
+    description: raw.desc || "",
+    artworkUrl: secureUrl(raw.logo || raw.picUrl || raw.albumPicUrl || ""),
+    owner: ownerRef(raw.uin, raw.nickname || raw.nick),
+    trackCount: Number(raw.songnum || raw.songNum || 0),
+    playCount: 0,
+    subscribed: true, owned: false,
+    mutable: false, deletable: false
   };
 }
 
@@ -278,6 +367,274 @@ function home(args) {
     var list = (data.v_hot || []).map(playlistDto);
     return { songs: [], playlists: list.slice(0, Number(args.limit || 12)) };
   });
+}
+
+/** 一页歌单详情。第二页起只要歌曲,省掉重复的 dirinfo/标签。 */
+function dissPage(tid, begin, num) {
+  return loadCookies().then(function (cookies) {
+    return musicu({
+      req: {
+        module: "music.srfDissInfo.aiDissInfo",
+        method: "uniform_get_Dissinfo",
+        param: {
+          disstid: Number(tid), userinfo: 1, tag: 1, orderlist: 1,
+          song_begin: begin, song_num: num, onlysonglist: begin > 0 ? 1 : 0,
+          // 自己的私密歌单要靠这个加密 uin 才认领得到。
+          enc_host_uin: String(cookies.euin || "")
+        }
+      }
+    });
+  }).then(function (body) {
+    var node = body.req || {};
+    if (Number(node.code || 0) !== 0) {
+      throw new Error("歌单加载失败(" + node.code + ")");
+    }
+    return node.data || {};
+  });
+}
+
+function playlistDetails(args) {
+  var tid = String(args.id || "");
+  if (!tid) throw new Error("缺少歌单 ID");
+  return dissPage(tid, 0, DISS_PAGE).then(function (first) {
+    var dir = first.dirinfo || {};
+    var songs = (first.songlist || []).slice();
+    var total = Math.min(MAX_PLAYLIST_SONGS,
+      Number(dir.songnum || first.total_song_num || songs.length || 0));
+    var offsets = [];
+    for (var begin = songs.length; begin > 0 && begin < total; begin += DISS_PAGE) {
+      offsets.push(begin);
+    }
+    // 顺序续拉:并发对同一个歌单会被限流,而歌单顺序本身也要保持。
+    return offsets.reduce(function (chain, begin) {
+      return chain.then(function () {
+        return dissPage(tid, begin, DISS_PAGE).then(function (page) {
+          songs = songs.concat(page.songlist || []);
+        });
+      });
+    }, Promise.resolve()).then(function () {
+      return dirinfoDto(dir, tid, songs.map(songDto));
+    });
+  });
+}
+
+/** 登录态下的真实 uin;未登录返回 ""。 */
+function requireUin() {
+  return loadCookies().then(function (cookies) {
+    var uin = musicUin(cookies);
+    return musicKey(cookies) && uin !== "0" ? uin : "";
+  });
+}
+
+function userPlaylists(args) {
+  var limit = Math.min(500, Math.max(1, Number(args.limit || 100)));
+  return requireUin().then(function (uin) {
+    if (!uin) return [];
+    return musicu({
+      mine: {
+        module: "music.musicasset.PlaylistBaseRead",
+        method: "GetPlaylistByUin",
+        param: { uin: uin }
+      },
+      fav: {
+        module: "music.musicasset.PlaylistFavRead",
+        method: "GetPlaylistFavInfo",
+        param: { uin: uin, offset: 0, size: Math.min(100, limit) }
+      }
+    }).then(function (body) {
+      var out = [];
+      var mine = (body.mine && body.mine.data || {}).v_playlist || [];
+      mine.forEach(function (item) {
+        var dto = ownPlaylistDto(item);
+        // 「我喜欢」排在最前,和 QQ 音乐自己的顺序一致。
+        if (dto.id && dto.name) {
+          if (Number((item || {}).dirId || 0) === FAV_DIR_ID) out.unshift(dto);
+          else out.push(dto);
+        }
+      });
+      var fav = (body.fav && body.fav.data || {}).v_list || [];
+      fav.forEach(function (item) {
+        var dto = favPlaylistDto(item);
+        if (dto.id && dto.name) out.push(dto);
+      });
+      return out.slice(0, limit);
+    });
+  });
+}
+
+/** tid → 本地目录号(写接口只认 dirId)。 */
+function dirIdForTid(tid) {
+  var wanted = String(tid || "");
+  return requireUin().then(function (uin) {
+    if (!uin) throw new Error("请先登录 QQ 音乐");
+    return musicu({
+      mine: {
+        module: "music.musicasset.PlaylistBaseRead",
+        method: "GetPlaylistByUin",
+        param: { uin: uin }
+      }
+    }).then(function (body) {
+      var list = (body.mine && body.mine.data || {}).v_playlist || [];
+      for (var i = 0; i < list.length; i++) {
+        if (String((list[i] || {}).tid || "") === wanted) return Number(list[i].dirId || 0);
+      }
+      throw new Error("这个歌单不是你创建的，无法修改");
+    });
+  });
+}
+
+/** 「我喜欢」的 tid;没登录或没有该目录时返回 0。 */
+function favPlaylistTid() {
+  return requireUin().then(function (uin) {
+    if (!uin) return 0;
+    return musicu({
+      mine: {
+        module: "music.musicasset.PlaylistBaseRead",
+        method: "GetPlaylistByUin",
+        param: { uin: uin }
+      }
+    }).then(function (body) {
+      var list = (body.mine && body.mine.data || {}).v_playlist || [];
+      for (var i = 0; i < list.length; i++) {
+        if (Number((list[i] || {}).dirId || 0) === FAV_DIR_ID) return Number(list[i].tid || 0);
+      }
+      return 0;
+    });
+  });
+}
+
+function songNumericId(mid) {
+  var key = String(mid || "");
+  if (!key) return Promise.reject(new Error("缺少歌曲 ID"));
+  if (numericIds[key]) return Promise.resolve(numericIds[key]);
+  return songDetails({ ids: [key] }).then(function () {
+    if (numericIds[key]) return numericIds[key];
+    throw new Error("无法解析歌曲编号");
+  });
+}
+
+/** 往目录里增删歌曲。写接口的 comm 必须是 WRITE_COMM,参数名也是驼峰的 dirId。 */
+function writeSonglist(dirId, songIds, add) {
+  var songs = songIds.map(function (id) { return { songId: Number(id), songType: 0 }; });
+  return musicu({
+    req: {
+      module: "music.musicasset.PlaylistDetailWrite",
+      method: add ? "AddSonglist" : "DelSonglist",
+      param: { dirId: Number(dirId), v_songInfo: songs }
+    }
+  }, WRITE_COMM).then(function (body) {
+    var node = body.req || {};
+    if (Number(node.code || 0) !== 0) throw new Error("操作失败(" + node.code + ")");
+    return true;
+  });
+}
+
+function like(args) {
+  switch (args.operation) {
+    case "list":
+      return favPlaylistTid().then(function (tid) {
+        if (!tid) return [];
+        return dissPage(tid, 0, DISS_PAGE).then(function (data) {
+          var total = Math.min(MAX_PLAYLIST_SONGS,
+            Number((data.dirinfo || {}).songnum || 0));
+          var songs = (data.songlist || []).slice();
+          var offsets = [];
+          for (var begin = songs.length; begin > 0 && begin < total; begin += DISS_PAGE) {
+            offsets.push(begin);
+          }
+          return offsets.reduce(function (chain, begin) {
+            return chain.then(function () {
+              return dissPage(tid, begin, DISS_PAGE).then(function (page) {
+                songs = songs.concat(page.songlist || []);
+              });
+            });
+          }, Promise.resolve()).then(function () {
+            return songs.map(function (song) {
+              rememberNumericId((song || {}).mid, (song || {}).id);
+              return String((song || {}).mid || "");
+            }).filter(Boolean);
+          });
+        });
+      });
+    case "set":
+      return songNumericId(args.id).then(function (songId) {
+        return writeSonglist(FAV_DIR_ID, [songId], args.liked !== false);
+      });
+    default:
+      throw new Error("未知收藏操作");
+  }
+}
+
+function playlistMutation(args) {
+  switch (args.operation) {
+    case "create": {
+      var name = String(args.name || "").trim();
+      if (!name) throw new Error("歌单名称为空");
+      return musicu({
+        req: {
+          module: "music.musicasset.PlaylistBaseWrite",
+          method: "AddPlaylist",
+          param: { dirName: name }
+        }
+      }, WRITE_COMM).then(function (body) {
+        var node = body.req || {};
+        if (Number(node.code || 0) !== 0) throw new Error("创建歌单失败(" + node.code + ")");
+        var result = (node.data || {}).result || {};
+        return { id: String(result.tid || "") };
+      });
+    }
+    case "delete":
+      return dirIdForTid(args.playlistId).then(function (dirId) {
+        if (dirId === FAV_DIR_ID) throw new Error("「我喜欢」不能删除");
+        return musicu({
+          req: {
+            module: "music.musicasset.PlaylistBaseWrite",
+            method: "DelPlaylist",
+            param: { dirId: dirId }
+          }
+        }, WRITE_COMM).then(function (body) {
+          var node = body.req || {};
+          if (Number(node.code || 0) !== 0) throw new Error("删除歌单失败(" + node.code + ")");
+          return true;
+        });
+      });
+    case "add":
+    case "remove": {
+      var adding = args.operation === "add";
+      var mids = (args.songIds || []).filter(Boolean);
+      if (!mids.length) return true;
+      return dirIdForTid(args.playlistId).then(function (dirId) {
+        return Promise.all(mids.map(songNumericId)).then(function (ids) {
+          return writeSonglist(dirId, ids, adding);
+        });
+      });
+    }
+    case "subscribe": {
+      // 宿主用同一个操作表达收藏与取消,已收藏的歌单再点一次即取消。
+      var tid = Number(args.playlistId || 0);
+      if (!tid) throw new Error("缺少歌单 ID");
+      return userPlaylists({ limit: 500 }).then(function (playlists) {
+        var subscribed = playlists.some(function (item) {
+          return item.id === String(tid) && item.subscribed;
+        });
+        return musicu({
+          req: {
+            module: "music.musicasset.PlaylistFavWrite",
+            method: subscribed ? "CancelFavPlaylist" : "FavPlaylist",
+            param: subscribed
+              ? { v_playlistId: [tid] }
+              : { v_playlistId: [tid], opType: 1 }
+          }
+        }, WRITE_COMM).then(function (body) {
+          var node = body.req || {};
+          if (Number(node.code || 0) !== 0) throw new Error("操作失败(" + node.code + ")");
+          return true;
+        });
+      });
+    }
+    default:
+      throw new Error("未知歌单操作");
+  }
 }
 
 function artistDetails(args) {
@@ -421,12 +778,38 @@ function account() {
     var uin = musicUin(cookies);
     var key = musicKey(cookies);
     if (!key || uin === "0") return { loggedIn: false };
-    return {
+    // 扫码登录时服务端顺带回了昵称,粘贴/网页登录没有,所以昵称统一去用户资料
+    // 接口取,拿不到才退回会话里的旧值,最后才是 QQ 号。
+    var fallback = {
       loggedIn: true, id: uin,
       displayName: session.nick || ("QQ " + uin),
-      avatarUrl: session.logo || "",
+      avatarUrl: secureUrl(session.logo || ""),
       membershipTier: 0, level: 0, signature: ""
     };
+    return musicu({
+      info: {
+        module: "userInfo.BaseUserInfoServer",
+        method: "get_user_baseinfo_v2",
+        param: { vec_uin: [uin] }
+      },
+      vip: {
+        module: "userInfo.VipQueryServer",
+        method: "SRFVipQuery_V2",
+        param: { uin_list: [uin] }
+      }
+    }).then(function (body) {
+      var profile = ((body.info && body.info.data || {}).map_userinfo || {})[uin] || {};
+      var vip = ((body.vip && body.vip.data || {}).infoMap || {})[uin] || {};
+      return {
+        loggedIn: true, id: uin,
+        displayName: profile.nick || fallback.displayName,
+        avatarUrl: secureUrl(profile.headurl || session.logo || ""),
+        // 宿主只用它区分普通/会员,超级会员单列一档。
+        membershipTier: Number(vip.iSuperVip || 0) ? 2 : (Number(vip.iVipFlag || 0) ? 1 : 0),
+        level: Number(vip.iCurLevel || 0),
+        signature: profile.desc || profile.mark || ""
+      };
+    }, function () { return fallback; });
   });
 }
 
@@ -489,6 +872,15 @@ function login(args) {
   switch (args.operation) {
     case "methods":
       return [{
+        // QQ 号扫码只能走这里:ptqrshow 返回的是 PNG,二维码内容只存在于图像
+        // 里,而宿主要的是一串文本。网页登录则把整个官方登录页交给系统 WebView,
+        // QQ / 微信两种账号都能用。
+        id: "web", type: "web", label: "QQ / 微信登录",
+        instructions: "打开 QQ 音乐官方登录页，用 QQ 或微信登录后自动返回。",
+        webUrl: "https://y.qq.com/portal/profile.html",
+        cookieUrl: "https://y.qq.com",
+        credentialCookieName: "qm_keyst"
+      }, {
         id: "wxqr", type: "qr", label: "微信扫码",
         instructions: "用微信扫码并确认，即可登录绑定了该微信的 QQ 音乐账号。"
       }, {
@@ -542,11 +934,18 @@ function login(args) {
         return { methodId: args.methodId, status: "failed",
           message: "Cookie 中找不到 musickey/qm_keyst/qqmusic_key" };
       }
-      return call("credentials.put", { key: "cookies", value: JSON.stringify(parsed) }).then(function () {
-        return { methodId: args.methodId, status: "success",
-          account: { loggedIn: true, id: uin, displayName: "QQ " + uin,
-            avatarUrl: "", membershipTier: 0, level: 0, signature: "" } };
-      });
+      return call("credentials.put", { key: "cookies", value: JSON.stringify(parsed) })
+        // 上一次扫码登录留下的 session 会用它自己的 loginType/昵称盖掉这份新
+        // Cookie 的登录态,必须一起清掉。
+        .then(function () { return call("credentials.delete", { key: "session" }); },
+              function () { return call("credentials.delete", { key: "session" }); })
+        .then(function () { return account(); }, function () { return null; })
+        .then(function (profile) {
+          return { methodId: args.methodId, status: "success",
+            account: profile && profile.loggedIn ? profile
+              : { loggedIn: true, id: uin, displayName: "QQ " + uin,
+                  avatarUrl: "", membershipTier: 0, level: 0, signature: "" } };
+        });
     }
     case "logout":
       return call("credentials.delete", { key: "cookies" })
@@ -564,12 +963,16 @@ module.exports = {
   handlers: {
     searchSongs: searchSongs,
     songDetails: songDetails,
+    playlistDetails: playlistDetails,
     artistDetails: artistDetails,
     albumDetails: albumDetails,
     home: home,
+    userPlaylists: userPlaylists,
     resolveStream: resolveStream,
     lyrics: lyrics,
     account: account,
+    like: like,
+    playlistMutation: playlistMutation,
     login: login,
     "ui.unblock": unblock.ui
   }
