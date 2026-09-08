@@ -265,7 +265,7 @@ function ownerRef(uin, name) {
 }
 
 /** aiDissInfo 的 dirinfo(歌单详情页)。 */
-function dirinfoDto(dir, tid, songs) {
+function dirinfoDto(dir, tid, songs, subscribed) {
   dir = dir || {};
   var dirid = Number(dir.dirid || 0);
   var owned = Number(dir.owndir || 0) === 1;
@@ -277,7 +277,7 @@ function dirinfoDto(dir, tid, songs) {
     owner: ownerRef(dir.host_uin, dir.host_nick),
     trackCount: Number(dir.songnum || (songs || []).length || 0),
     playCount: Number(dir.listennum || 0),
-    subscribed: !owned && dirid > 0,
+    subscribed: !owned && !!subscribed,
     owned: owned,
     mutable: owned,
     // 「我喜欢」是账号自带的固定歌单,删不掉。
@@ -355,17 +355,57 @@ function songDetails(args) {
   });
 }
 
+/** 歌单广场推荐位。比 get_hot_recommend 多出歌曲数、播放量和收藏状态,但要登录。 */
+function squareDto(entry) {
+  var basic = ((entry || {}).Playlist || {}).basic || {};
+  var cover = basic.cover || {};
+  return {
+    id: String(basic.tid || ""),
+    name: basic.title || "",
+    description: basic.desc || "",
+    artworkUrl: secureUrl(cover.medium_url || cover.small_url || cover.big_url || ""),
+    owner: ownerRef((basic.creator || {}).uin, (basic.creator || {}).nick),
+    trackCount: Number(basic.song_cnt || 0),
+    playCount: Number(basic.play_cnt || 0),
+    subscribed: Number(basic.fav || 0) === 1,
+    owned: false
+  };
+}
+
 function home(args) {
-  return musicu({
-    recomPlaylist: {
-      module: "playlist.HotRecommendServer",
-      method: "get_hot_recommend",
-      param: { async: 1, cmd: 2 }
-    }
-  }).then(function (body) {
-    var data = body.recomPlaylist && body.recomPlaylist.data || {};
-    var list = (data.v_hot || []).map(playlistDto);
-    return { songs: [], playlists: list.slice(0, Number(args.limit || 12)) };
+  var limit = Number(args.limit || 12);
+  return requireUin().then(function (uin) {
+    if (!uin) return null;
+    // 未登录时这个模块直接回 1101,所以只在有登录态时用。
+    return musicu({
+      square: {
+        module: "music.playlist.PlaylistSquare",
+        method: "GetRecommendFeed",
+        param: { cmd: 2, category_id: 10000000, size: Math.min(50, Math.max(1, limit)) }
+      }
+    }).then(function (body) {
+      var node = body.square || {};
+      if (Number(node.code || 0) !== 0) return null;
+      var list = ((node.data || {}).List || []).map(squareDto).filter(function (item) {
+        return item.id && item.name;
+      });
+      return list.length ? list : null;
+    }, function () { return null; });
+  }).then(function (square) {
+    if (square) return { songs: [], playlists: square.slice(0, limit) };
+    // 退回匿名可用的热门推荐。它不带歌曲数,宿主会显示为「暂无歌曲」,只在
+    // 未登录或广场接口异常时才走到这里。
+    return musicu({
+      recomPlaylist: {
+        module: "playlist.HotRecommendServer",
+        method: "get_hot_recommend",
+        param: { async: 1, cmd: 2 }
+      }
+    }).then(function (body) {
+      var data = body.recomPlaylist && body.recomPlaylist.data || {};
+      var list = (data.v_hot || []).map(playlistDto);
+      return { songs: [], playlists: list.slice(0, limit) };
+    });
   });
 }
 
@@ -393,10 +433,33 @@ function dissPage(tid, begin, num) {
   });
 }
 
+/**
+ * 已收藏歌单的 tid 列表。歌单详情本身不带「我收藏了没有」这个状态(dirid 是
+ * 歌单自己的编号,任何人读到的都一样),只能拿收藏列表比对。
+ */
+function favTids() {
+  return requireUin().then(function (uin) {
+    if (!uin) return [];
+    return musicu({
+      fav: {
+        module: "music.musicasset.PlaylistFavRead",
+        method: "GetPlaylistFavInfo",
+        param: { uin: uin, offset: 0, size: 200 }
+      }
+    }).then(function (body) {
+      return ((body.fav && body.fav.data || {}).v_list || []).map(function (item) {
+        return String((item || {}).tid || "");
+      });
+    }, function () { return []; });
+  });
+}
+
 function playlistDetails(args) {
   var tid = String(args.id || "");
   if (!tid) throw new Error("缺少歌单 ID");
-  return dissPage(tid, 0, DISS_PAGE).then(function (first) {
+  return Promise.all([dissPage(tid, 0, DISS_PAGE), favTids()]).then(function (both) {
+    var first = both[0];
+    var subscribed = both[1].indexOf(tid) >= 0;
     var dir = first.dirinfo || {};
     var songs = (first.songlist || []).slice();
     var total = Math.min(MAX_PLAYLIST_SONGS,
@@ -413,7 +476,7 @@ function playlistDetails(args) {
         });
       });
     }, Promise.resolve()).then(function () {
-      return dirinfoDto(dir, tid, songs.map(songDto));
+      return dirinfoDto(dir, tid, songs.map(songDto), subscribed);
     });
   });
 }
@@ -609,27 +672,23 @@ function playlistMutation(args) {
         });
       });
     }
-    case "subscribe": {
-      // 宿主用同一个操作表达收藏与取消,已收藏的歌单再点一次即取消。
+    case "subscribe":
+    case "unsubscribe": {
       var tid = Number(args.playlistId || 0);
       if (!tid) throw new Error("缺少歌单 ID");
-      return userPlaylists({ limit: 500 }).then(function (playlists) {
-        var subscribed = playlists.some(function (item) {
-          return item.id === String(tid) && item.subscribed;
-        });
-        return musicu({
-          req: {
-            module: "music.musicasset.PlaylistFavWrite",
-            method: subscribed ? "CancelFavPlaylist" : "FavPlaylist",
-            param: subscribed
-              ? { v_playlistId: [tid] }
-              : { v_playlistId: [tid], opType: 1 }
-          }
-        }, WRITE_COMM).then(function (body) {
-          var node = body.req || {};
-          if (Number(node.code || 0) !== 0) throw new Error("操作失败(" + node.code + ")");
-          return true;
-        });
+      var canceling = args.operation === "unsubscribe";
+      return musicu({
+        req: {
+          module: "music.musicasset.PlaylistFavWrite",
+          method: canceling ? "CancelFavPlaylist" : "FavPlaylist",
+          param: canceling
+            ? { v_playlistId: [tid] }
+            : { v_playlistId: [tid], opType: 1 }
+        }
+      }, WRITE_COMM).then(function (body) {
+        var node = body.req || {};
+        if (Number(node.code || 0) !== 0) throw new Error("操作失败(" + node.code + ")");
+        return true;
       });
     }
     default:
