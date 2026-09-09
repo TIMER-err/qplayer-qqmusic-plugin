@@ -2,7 +2,6 @@
 
 // QQ 音乐源插件：搜索 / 歌曲详情 / 推荐歌单 / 播放地址(Vkey) / 歌词。
 // 播放(Vkey)需要登录:QQ 音乐客户端 Cookie 中的 musickey(2026 起匿名 vkey 已收紧)。
-// API 参考 Melodify QQMusicProvider / QQMusicApiClient 移植。
 
 var UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 var UA_MOBILE = "Mozilla/5.0 (iPhone; CPU iPhone OS 9_1 like Mac OS X) AppleWebKit/601.1.46 (KHTML, like Gecko) Version/9.0 Mobile/13B143 Safari/601.1";

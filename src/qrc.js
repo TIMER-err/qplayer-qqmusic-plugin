@@ -1,6 +1,6 @@
 "use strict";
 
-// QRC 歌词解密(Melodify QrcDecryptor 移植):hex → 3DES(自定义 S-box 的 DES)→ zlib inflate → UTF-8。
+// QRC 歌词解密:hex → 3DES(自定义 S-box 的 DES)→ zlib inflate → UTF-8。
 // 纯 JS 实现,不依赖宿主 crypto(宿主没有 DES 与 zlib)。
 
 var KEY = (function () {
@@ -41,7 +41,7 @@ function sBit(a) {
   return (v & 32) | ((v & 31) >> 1) | ((v & 1) << 4);
 }
 
-// ---- DES core (Melodify QrcDecryptor 逐行移植) ----
+// ---- DES core ----
 
 function initialPermutation(inBytes) {
   var s0 = bn(inBytes,57,31)|bn(inBytes,49,30)|bn(inBytes,41,29)|bn(inBytes,33,28)|
