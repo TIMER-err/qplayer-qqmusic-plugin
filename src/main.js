@@ -122,11 +122,17 @@ function httpPostJson(url, body, referer, headers) {
   });
 }
 
-/** 写接口(收藏/歌单增删)只在 ct=26 下被受理:ct=24 会返回 80105/1101。 */
-var WRITE_COMM = { ct: 26, cv: 0, needNewCode: 0 };
+/**
+ * 歌单写接口(红心、增删歌曲、收藏歌单)只认客户端形态的 comm:web 的 ct=24/26
+ * 会以 80105 被拒,响应里 dirId 回 0,即什么都没写进去。传 "write" 时由
+ * musicu() 在拿到 uin 之后补齐 qq 字段。
+ */
+var WRITE_COMM = "write";
+
+var ANDROID_COMM = { ct: 11, cv: 14090008, v: 14090008, chid: "10003505", tmeAppID: "qqmusic" };
 
 /** musicu.fcg 批量请求;带登录 cookie 时使用真实 uin 与 musickey。 */
-function musicu(entries, override) {
+function musicuOnce(entries, override) {
   return Promise.all([loadCookies(), loadSession()]).then(function (both) {
     var cookies = both[0];
     var session = both[1] || {};
@@ -138,7 +144,14 @@ function musicu(entries, override) {
       notice: 0, platform: "yqq.json", needNewCode: 1, uin: uin,
       g_tk: gtkValue, g_tk_new_20200303: gtkValue
     };
-    if (override) Object.keys(override).forEach(function (k) { comm[k] = override[k]; });
+    if (override === WRITE_COMM) {
+      Object.keys(ANDROID_COMM).forEach(function (k) { comm[k] = ANDROID_COMM[k]; });
+      comm.qq = uin;
+      comm.needNewCode = 0;
+      delete comm.platform;
+    } else if (override) {
+      Object.keys(override).forEach(function (k) { comm[k] = override[k]; });
+    }
     // 扫码登录的 musickey 要靠 authst + tmeLoginType 才被认;loginType 用服务端
     // 在 Login 响应里回的值,不写死(各家参考实现对这个编号的说法互相矛盾)。
     // 粘贴/网页登录拿到的 Cookie 自带 tmeLoginType,同样要带上,否则登录态只对
@@ -159,6 +172,97 @@ function musicu(entries, override) {
       if (parts.length) headers = { "Cookie": parts.join("; ") };
     }
     return httpPostJson(MUSICU, body, REF_BASE, headers);
+  });
+}
+
+/**
+ * musickey 只有几天寿命,过期后读接口大多还能匿名兜底,但凡是要登录的调用
+ * (播放地址、红心、收藏歌单)都会拿到 code 1000 / retcode 104009 "invalidq"。
+ * 界面上账号还挂着,操作却全部失败,所以这里在收到 1000 时自动换一次新 key。
+ */
+function needsRefresh(body) {
+  if (!body || typeof body !== "object") return false;
+  var keys = Object.keys(body);
+  for (var i = 0; i < keys.length; i++) {
+    var node = body[keys[i]];
+    if (!node || typeof node !== "object") continue;
+    if (Number(node.code) === 1000) return true;
+    if (node.data && Number(node.data.retcode) === 104009) return true;
+  }
+  return false;
+}
+
+var refreshing = null;
+var refreshedAt = 0;
+
+/**
+ * 换新 musickey。QQ 登录用 psrf_* 那组令牌,微信登录用扫码时存下的 refresh_token。
+ * 注意不能带 refresh_key:实测把 cookie 里的 RK 当 refresh_key 传,服务端一律回
+ * 1000,不传反而正常返回新 key。
+ */
+function refreshCredential() {
+  var now = Date.now();
+  if (refreshing) return refreshing;
+  if (now - refreshedAt < 60000) return Promise.resolve(false);
+  refreshing = Promise.all([loadCookies(), loadSession()]).then(function (both) {
+    var cookies = both[0], session = both[1] || {};
+    var key = musicKey(cookies);
+    var uin = musicUin(cookies);
+    if (!key || uin === "0") return false;
+    var loginType = Number(session.loginType || cookies.tmeLoginType || 2);
+    var param = loginType === 1
+      ? {
+          openid: String(cookies.wxopenid || session.openid || ""),
+          refresh_token: String(session.refreshToken || cookies.wxrefresh_token || ""),
+          str_musicid: String(uin), musickey: key,
+          unionid: String(session.unionid || cookies.wxunionid || ""), loginMode: 2
+        }
+      : {
+          openid: String(cookies.psrf_qqopenid || ""),
+          access_token: String(cookies.psrf_qqaccess_token || ""),
+          refresh_token: String(cookies.psrf_qqrefresh_token || ""),
+          expired_in: Number(cookies.psrf_access_token_expiresAt || 0),
+          musicid: Number(uin), musickey: key, loginMode: 2
+        };
+    var comm = { format: "json", inCharset: "utf-8", outCharset: "utf-8", notice: 0,
+                 tmeLoginType: loginType };
+    Object.keys(ANDROID_COMM).forEach(function (k) { comm[k] = ANDROID_COMM[k]; });
+    return httpPostJson(MUSICU, {
+      comm: comm,
+      req: { module: "music.login.LoginServer", method: "Login", param: param }
+    }, REF_BASE).then(function (body) {
+      var data = (body.req || {}).data || {};
+      var fresh = String(data.musickey || "");
+      if (!fresh) return false;
+      var id = String(data.musicid || data.str_musicid || uin);
+      var updated = {};
+      Object.keys(cookies).forEach(function (k) { updated[k] = cookies[k]; });
+      updated.musickey = fresh;
+      updated.qm_keyst = fresh;
+      updated.qqmusic_key = fresh;
+      updated.uin = id;
+      updated.musicid = id;
+      if (data.refresh_token) updated.psrf_qqrefresh_token = String(data.refresh_token);
+      if (data.access_token) updated.psrf_qqaccess_token = String(data.access_token);
+      if (data.expired_at) updated.psrf_access_token_expiresAt = String(data.expired_at);
+      if (data.musickeyCreateTime) updated.psrf_musickey_createtime = String(data.musickeyCreateTime);
+      return call("credentials.put", { key: "cookies", value: JSON.stringify(updated) })
+        .then(function () { return true; });
+    });
+  }).catch(function () { return false; }).then(function (ok) {
+    refreshing = null;
+    refreshedAt = Date.now();
+    return ok;
+  });
+  return refreshing;
+}
+
+function musicu(entries, override) {
+  return musicuOnce(entries, override).then(function (body) {
+    if (!needsRefresh(body)) return body;
+    return refreshCredential().then(function (ok) {
+      return ok ? musicuOnce(entries, override) : body;
+    });
   });
 }
 
@@ -575,6 +679,13 @@ function songNumericId(mid) {
   });
 }
 
+/** 写接口的失败码翻译成用户看得懂的话。 */
+function writeFailure(code, action) {
+  if (Number(code) === 1000) return new Error("QQ 音乐登录已失效，请重新登录");
+  if (Number(code) === 80105) return new Error(action + "失败，请稍后重试");
+  return new Error(action + "失败(" + code + ")");
+}
+
 /** 往目录里增删歌曲。写接口的 comm 必须是 WRITE_COMM,参数名也是驼峰的 dirId。 */
 function writeSonglist(dirId, songIds, add) {
   var songs = songIds.map(function (id) { return { songId: Number(id), songType: 0 }; });
@@ -586,7 +697,7 @@ function writeSonglist(dirId, songIds, add) {
     }
   }, WRITE_COMM).then(function (body) {
     var node = body.req || {};
-    if (Number(node.code || 0) !== 0) throw new Error("操作失败(" + node.code + ")");
+    if (Number(node.code || 0) !== 0) throw writeFailure(node.code, add ? "添加歌曲" : "移除歌曲");
     return true;
   });
 }
@@ -640,7 +751,7 @@ function playlistMutation(args) {
         }
       }, WRITE_COMM).then(function (body) {
         var node = body.req || {};
-        if (Number(node.code || 0) !== 0) throw new Error("创建歌单失败(" + node.code + ")");
+        if (Number(node.code || 0) !== 0) throw writeFailure(node.code, "创建歌单");
         var result = (node.data || {}).result || {};
         return { id: String(result.tid || "") };
       });
@@ -656,7 +767,7 @@ function playlistMutation(args) {
           }
         }, WRITE_COMM).then(function (body) {
           var node = body.req || {};
-          if (Number(node.code || 0) !== 0) throw new Error("删除歌单失败(" + node.code + ")");
+          if (Number(node.code || 0) !== 0) throw writeFailure(node.code, "删除歌单");
           return true;
         });
       });
@@ -676,17 +787,21 @@ function playlistMutation(args) {
       var tid = Number(args.playlistId || 0);
       if (!tid) throw new Error("缺少歌单 ID");
       var canceling = args.operation === "unsubscribe";
-      return musicu({
-        req: {
-          module: "music.musicasset.PlaylistFavWrite",
-          method: canceling ? "CancelFavPlaylist" : "FavPlaylist",
-          param: canceling
-            ? { v_playlistId: [tid] }
-            : { v_playlistId: [tid], opType: 1 }
-        }
-      }, WRITE_COMM).then(function (body) {
+      return loadCookies().then(function (cookies) {
+        var param = { uin: String(cookies.euin || ""), v_playlistId: [tid] };
+        if (!canceling) param.opType = 1;
+        return musicu({
+          req: {
+            module: "music.musicasset.PlaylistFavWrite",
+            method: canceling ? "CancelFavPlaylist" : "FavPlaylist",
+            param: param
+          }
+        }, WRITE_COMM);
+      }).then(function (body) {
         var node = body.req || {};
-        if (Number(node.code || 0) !== 0) throw new Error("操作失败(" + node.code + ")");
+        if (Number(node.code || 0) !== 0) {
+          throw writeFailure(node.code, canceling ? "取消收藏" : "收藏歌单");
+        }
         return true;
       });
     }
