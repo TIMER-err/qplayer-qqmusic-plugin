@@ -306,6 +306,21 @@ function songDto(raw) {
   };
 }
 
+/**
+ * 宿主是整份解析歌曲列表的:parseSong 一遇到空 id 就抛 "song.id is empty",
+ * 于是一首拿不到 mid 的歌(下架/无版权的曲目会以残缺条目回来)就能让整张歌单、
+ * 整张专辑或整页搜索结果全部加载失败。批量映射一律走这里,把没有 mid 的条目
+ * 丢掉,而不是让它毒死整个结果。
+ */
+function songsOf(list, pick) {
+  var out = [];
+  (list || []).forEach(function (row) {
+    var dto = songDto(pick ? pick(row) : row);
+    if (dto.id) out.push(dto);
+  });
+  return out;
+}
+
 /** QQ 的图片 mid 有两种形态:裸 mid 和带版本后缀的 pmid,两者都能取到图。 */
 function photoUrl(prefix, id) {
   return id ? "https://y.gtimg.cn/music/photo_new/" + prefix + "R300x300M000" + id + ".jpg" : "";
@@ -431,7 +446,7 @@ function searchSongs(args) {
     + "&format=json&p=" + page + "&n=" + Number(args.limit || 50);
   return httpGetJson(url, REF_SEARCH, UA_MOBILE).then(function (body) {
     var data = (body.data || {}).song || {};
-    var items = (data.list || []).map(songDto);
+    var items = songsOf(data.list);
     var hasMore = page * Number(args.limit || 50) < Number(data.totalnum || items.length);
     return { items: items, nextCursor: hasMore ? String(page * Number(args.limit || 50)) : "" };
   });
@@ -579,7 +594,7 @@ function playlistDetails(args) {
         });
       });
     }, Promise.resolve()).then(function () {
-      return dirinfoDto(dir, tid, songs.map(songDto), subscribed);
+      return dirinfoDto(dir, tid, songsOf(songs), subscribed);
     });
   });
 }
@@ -836,9 +851,7 @@ function artistDetails(args) {
     var extra = singer.ex_info || {};
     var songData = body.songs && body.songs.data || {};
     var albumData = body.albums && body.albums.data || {};
-    var songs = (songData.songList || []).map(function (row) {
-      return songDto((row || {}).songInfo);
-    });
+    var songs = songsOf(songData.songList, function (row) { return (row || {}).songInfo; });
     var albums = (albumData.albumList || []).map(function (row) { return albumDto(row, null); });
     return {
       id: mid,
@@ -870,9 +883,7 @@ function albumDetails(args) {
   }).then(function (body) {
     var basic = (body.info && body.info.data || {}).basicInfo || {};
     var songData = body.songs && body.songs.data || {};
-    var songs = (songData.songList || []).map(function (row) {
-      return songDto((row || {}).songInfo);
-    });
+    var songs = songsOf(songData.songList, function (row) { return (row || {}).songInfo; });
     if (!basic.albumMid) basic.albumMid = mid;
     if (!basic.totalNum) basic.totalNum = songData.totalNum;
     return albumDto(basic, songs);
