@@ -701,6 +701,150 @@ function writeFailure(code, action) {
   return new Error(action + "失败(" + code + ")");
 }
 
+// ---- 歌单封面 --------------------------------------------------------------
+//
+// QQ 这边分两步,且跟本插件其余请求都不一样:
+//   1. multipart 上传图片到 s.plcloud.music.qq.com,换回一个 imageurl;
+//   2. EditPlaylist 把那个 URL 写进歌单的 dirNewPicUrl。
+// 也就是说 QQ 存的是图片地址而不是图片本身,跟网易云"上传拿 docId"的路子不同。
+//
+// 两个坑:该主机只有 http(https 握手直接失败),所以依赖 clearTextNetwork 权限;
+// 响应是 application/json,网页端那套 iframe 回调只是它自己的历史包袱,不用管。
+
+var UPLOAD_IMAGE = "http://s.plcloud.music.qq.com/fcgi-bin/fcg_upload_image.fcg";
+var B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/** latin1 字符串 -> base64。宿主跑的是 Rhino,没有 btoa。 */
+function toBase64(binary) {
+  var out = "";
+  var i = 0;
+  while (i < binary.length) {
+    var c1 = binary.charCodeAt(i++) & 0xff;
+    var has2 = i < binary.length;
+    var c2 = has2 ? binary.charCodeAt(i++) & 0xff : 0;
+    var has3 = i < binary.length;
+    var c3 = has3 ? binary.charCodeAt(i++) & 0xff : 0;
+    out += B64_ALPHABET.charAt(c1 >> 2);
+    out += B64_ALPHABET.charAt(((c1 & 3) << 4) | (c2 >> 4));
+    out += has2 ? B64_ALPHABET.charAt(((c2 & 15) << 2) | (c3 >> 6)) : "=";
+    out += has3 ? B64_ALPHABET.charAt(c3 & 63) : "=";
+  }
+  return out;
+}
+
+/** base64 -> latin1 字符串(每个字符正好一个字节),好跟文本段拼成 multipart。 */
+function fromBase64(text) {
+  var clean = "";
+  var raw = String(text || "");
+  for (var k = 0; k < raw.length; k++) {
+    if (B64_ALPHABET.indexOf(raw.charAt(k)) >= 0) clean += raw.charAt(k);
+  }
+  var out = "";
+  var i = 0;
+  while (i + 1 < clean.length) {
+    var e1 = B64_ALPHABET.indexOf(clean.charAt(i++));
+    var e2 = B64_ALPHABET.indexOf(clean.charAt(i++));
+    out += String.fromCharCode(((e1 << 2) | (e2 >> 4)) & 0xff);
+    if (i < clean.length) {
+      var e3 = B64_ALPHABET.indexOf(clean.charAt(i++));
+      out += String.fromCharCode((((e2 & 15) << 4) | (e3 >> 2)) & 0xff);
+      if (i < clean.length) {
+        var e4 = B64_ALPHABET.indexOf(clean.charAt(i++));
+        out += String.fromCharCode((((e3 & 3) << 6) | e4) & 0xff);
+      }
+    }
+  }
+  return out;
+}
+
+/** 组一个 multipart/form-data 体。字段值和文件名都只用 ASCII,省掉编码这一层。 */
+function multipartBody(boundary, fields, fileField, filename, binary) {
+  var body = "";
+  Object.keys(fields).forEach(function (name) {
+    body += "--" + boundary + "\r\n"
+      + "Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n"
+      + fields[name] + "\r\n";
+  });
+  body += "--" + boundary + "\r\n"
+    + "Content-Disposition: form-data; name=\"" + fileField + "\"; filename=\"" + filename + "\"\r\n"
+    + "Content-Type: image/jpeg\r\n\r\n"
+    + binary + "\r\n"
+    + "--" + boundary + "--\r\n";
+  return body;
+}
+
+/** 把存下来的 cookie 拼成请求头,跟 musicu() 用的是同一套。 */
+function cookieHeader(cookies) {
+  var parts = [];
+  Object.keys(cookies || {}).forEach(function (name) {
+    if (cookies[name]) {
+      parts.push(encodeURIComponent(name) + "=" + encodeURIComponent(String(cookies[name])));
+    }
+  });
+  return parts.length ? parts.join("; ") : "";
+}
+
+/**
+ * 更换歌单封面。宿主把用户选的图片原样丢过来,由插件走完各家私有的上传流程。
+ *
+ * mask 固定 4 —— 位掩码里只有"封面"那一位。EditPlaylist 能一次改名字/简介/标签,
+ * 但那要求把这些字段一并回传;只报封面这一位,名字和简介就不会被空值顺手清掉。
+ */
+function playlistCover(args) {
+  var imageBase64 = String(args.imageBase64 || "");
+  if (!imageBase64) throw new Error("图片为空");
+  return Promise.all([dirIdForTid(args.playlistId), requireUin(), loadCookies()])
+    .then(function (all) {
+      var dirId = all[0];
+      var uin = all[1];
+      var cookies = all[2];
+      if (!uin) throw new Error("请先登录 QQ 音乐");
+      var boundary = "----QPlayerCover" + Date.now();
+      var headers = {
+        "Content-Type": "multipart/form-data; boundary=" + boundary,
+        "User-Agent": UA_PC,
+        "Referer": REF_BASE
+      };
+      var cookie = cookieHeader(cookies);
+      if (cookie) headers["Cookie"] = cookie;
+      var body = multipartBody(boundary, {
+        auth_appid: "music_cover",
+        parentid: "/",
+        fileid: String(Date.now()),
+        uin: String(uin)
+      }, "data", "cover.jpg", fromBase64(imageBase64));
+      return call("http.request", {
+        url: UPLOAD_IMAGE,
+        method: "POST",
+        headers: headers,
+        bodyBase64: toBase64(body),
+        timeoutMs: 30000
+      }).then(function (response) {
+        if (response.status < 200 || response.status >= 300) {
+          throw new Error("上传封面失败 HTTP " + response.status);
+        }
+        var data;
+        try { data = JSON.parse(response.body || "{}"); }
+        catch (_) { throw new Error("上传封面失败：响应无法解析"); }
+        var imageUrl = String(data.imageurl || "");
+        if (Number(data.retcode || 0) !== 0 || !imageUrl) {
+          throw new Error(data.msg || data.message || "上传封面失败");
+        }
+        return musicu({
+          req: {
+            module: "music.musicasset.PlaylistBaseWrite",
+            method: "EditPlaylist",
+            param: { dirId: Number(dirId), mask: 4, dirNewPicUrl: secureUrl(imageUrl) }
+          }
+        }, WRITE_COMM).then(function (result) {
+          var node = result.req || {};
+          if (Number(node.code || 0) !== 0) throw writeFailure(node.code, "更换封面");
+          return { success: true };
+        });
+      });
+    });
+}
+
 /** 往目录里增删歌曲。写接口的 comm 必须是 WRITE_COMM,参数名也是驼峰的 dirId。 */
 function writeSonglist(dirId, songIds, add) {
   var songs = songIds.map(function (id) { return { songId: Number(id), songType: 0 }; });
@@ -1157,6 +1301,7 @@ module.exports = {
     account: account,
     like: like,
     playlistMutation: playlistMutation,
+    playlistCover: playlistCover,
     login: login,
     "ui.unblock": unblock.ui
   }

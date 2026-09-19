@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "qq",
   "name": "QQ音乐",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "apiVersion": "1.0",
-  "minHostVersion": "1.4.0",
+  "minHostVersion": "1.6.1",
   "entry": "src/main.js",
   "publisher": "TIMER-err",
   "capabilities": [
@@ -20,6 +20,7 @@
     "account",
     "like",
     "playlistMutation",
+    "playlistCover",
     "login"
   ],
   "permissions": [
@@ -38,6 +39,7 @@
     "qpic.y.qq.com",
     "music-file.y.qq.com",
     "ws.stream.qqmusic.qq.com",
+    "s.plcloud.music.qq.com",
     "y.gtimg.cn",
     "*.gtimg.cn",
     "open.weixin.qq.com",
