@@ -845,6 +845,173 @@ function playlistCover(args) {
     });
 }
 
+// ---- 歌单内歌曲排序 ---------------------------------------------------------
+//
+// QQ 没有「只改顺序」的接口。网页端 y.qq.com/portal/mymusic_edit.html 的拖动排序
+// 走的是整张歌单的保存表单:标题、简介、封面、标签、可见性和完整的 mid 顺序一起
+// POST 上去。musicu 那套 PlaylistDetailWrite 只有 AddSonglist/DelSonglist,翻遍
+// 公开实现也没有第三个方法,所以这里只能照抄网页端这条路。
+//
+// 于是 reorder 必须先把歌单现有的元信息原样读回来再一起回传 —— 少传一项就等于
+// 用空值把它覆盖掉。读的 fcg_musiclist_getinfo_cp.fcg 正是网页端填这张表单时用
+// 的那个接口,字段进出都不加工,并且任何一项缺失就直接抛错退出:宁可排序不生效,
+// 也不能拿空值覆盖用户的歌单信息。
+var LIST_INFO = "https://c.y.qq.com/splcloud/fcgi-bin/fcg_musiclist_getinfo_cp.fcg";
+var MODIFY_SONGLIST = "https://c.y.qq.com/splcloud/fcgi-bin/fcg_unified_modify_songlist.fcg";
+
+function formBody(fields) {
+  var parts = [];
+  Object.keys(fields).forEach(function (name) {
+    parts.push(encodeURIComponent(name) + "=" + encodeURIComponent(String(fields[name])));
+  });
+  return parts.join("&");
+}
+
+/** 这两个老 CGI 就算要了 format=json,回来的也可能仍裹着 jsonCallback(...)。 */
+function parseLooseJson(text) {
+  var body = String(text || "");
+  var start = body.indexOf("{");
+  var end = body.lastIndexOf("}");
+  if (start < 0 || end <= start) throw new Error("响应无法解析");
+  return JSON.parse(body.slice(start, end + 1));
+}
+
+/** 带登录态读歌单的编辑态信息(私密歌单也要靠 cookie 才读得到)。 */
+function songlistInfo(uin, dirId) {
+  return loadCookies().then(function (cookies) {
+    var url = LIST_INFO + "?uin=" + encodeURIComponent(uin)
+      + "&dirid=" + Number(dirId)
+      + "&new=0&dirinfo=1&user=qqmusic&miniportal=1&fromDir2Diss=1&comPic=0&format=json";
+    var headers = { "User-Agent": UA_PC, "Referer": REF_BASE };
+    var cookie = cookieHeader(cookies);
+    if (cookie) headers["Cookie"] = cookie;
+    return call("http.request", {
+      url: url, method: "GET", headers: headers, timeoutMs: 20000
+    }).then(function (response) {
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error("读取歌单信息失败 HTTP " + response.status);
+      }
+      var data = parseLooseJson(response.body);
+      if (Number(data.code || 0) !== 0) {
+        throw new Error("读取歌单信息失败(" + data.code + ")");
+      }
+      return data;
+    });
+  });
+}
+
+/**
+ * 还原网页端给每首歌算 types 的那段逻辑。player.js 的 formatMusic 先по type 定
+ * mtype,mymusic_edit.js 再把 mtype 折成表单要的 1/3 两档:
+ *   mtype = type 非 0 ? "net" : "qqmusic";111/112/113 强制 "qqmusic"
+ *   type 为 0 且 action.soso 为 1 时,type 改判 3、mtype 改判 "net"
+ *   表单 types = (mtype 是 "qqmusic" 或 (mtype 是 "net" 且 type 是 3)) ? 3 : 1
+ */
+function songlistEntryType(entry) {
+  var raw = Number((entry || {}).type || 0) % 10 === 1 ? entry : (entry || {}).data;
+  raw = raw || {};
+  var type = Number(raw.type || 0);
+  var mtype = type !== 0 ? "net" : "qqmusic";
+  if (type === 0 && Number((raw.action || {}).soso || 0) === 1) {
+    type = 3;
+    mtype = "net";
+  }
+  if (type === 111 || type === 112 || type === 113) mtype = "qqmusic";
+  return (mtype === "qqmusic" || (mtype === "net" && type === 3)) ? 3 : 1;
+}
+
+function songlistEntryMid(entry) {
+  var raw = Number((entry || {}).type || 0) % 10 === 1 ? entry : (entry || {}).data;
+  return String((raw || {}).songmid || "");
+}
+
+function playlistReorder(args) {
+  var wanted = (args.songIds || []).map(String);
+  if (!wanted.length) throw new Error("歌曲列表为空");
+  return Promise.all([dirIdForTid(args.playlistId), requireUin()]).then(function (both) {
+    var dirId = both[0];
+    var uin = both[1];
+    if (!uin) throw new Error("请先登录 QQ 音乐");
+    return songlistInfo(uin, dirId).then(function (info) {
+      // 整单覆盖,所以宁可什么都不做也不能带着缺失字段上去。
+      var title = String(info.Title || "");
+      if (!title) throw new Error("读不到歌单名称，已放弃排序以免清空歌单信息");
+      if (info.show === undefined || info.show === null) {
+        throw new Error("读不到歌单可见性，已放弃排序以免清空歌单信息");
+      }
+      var tagIds;
+      if (typeof info.tagList === "string") {
+        tagIds = info.tagList;
+      } else if (Object.prototype.toString.call(info.tags) === "[object Array]") {
+        tagIds = info.tags.map(function (tag) { return String((tag || {}).id || ""); })
+          .filter(Boolean).join(",");
+      } else {
+        throw new Error("读不到歌单标签，已放弃排序以免清空歌单信息");
+      }
+
+      var byMid = {};
+      (info.SongList || []).forEach(function (entry) {
+        var mid = songlistEntryMid(entry);
+        if (mid) byMid[mid] = songlistEntryType(entry);
+      });
+      var mids = [];
+      var types = [];
+      for (var i = 0; i < wanted.length; i++) {
+        var type = byMid[wanted[i]];
+        // 宿主那份列表和服务端对不上(别处刚改过),照这个顺序回传会把对不上的歌
+        // 一并删掉。让它失败,宿主会重新拉一次歌单。
+        if (type === undefined) throw new Error("歌单内容已变化，请刷新后重试");
+        mids.push(wanted[i]);
+        types.push(type);
+      }
+      if (mids.length !== (info.SongList || []).length) {
+        throw new Error("歌单内容已变化，请刷新后重试");
+      }
+
+      var fields = {
+        uin: String(uin),
+        // 表单是整单覆盖:这四项都是原样读回来再写回去,不是在改它们。
+        moddirnames: title.replace(/,/g, "，"),
+        moddesc: String(info.Desc || ""),
+        moddirids: Number(dirId),
+        dirid: Number(dirId),
+        modFPicUrl: String(info.PicUrl || ""),
+        dir_pic_url2: String(info.DirPicUrl2 || ""),
+        moddirshows: String(info.show),
+        modtagidList: tagIds,
+        ismodifylist: 1,
+        mids: mids.join(","),
+        types: types.join(","),
+        source: 103,
+        modnum: 1,
+        formsender: 1
+      };
+      return loadCookies().then(function (cookies) {
+        var headers = {
+          "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+          "User-Agent": UA_PC,
+          "Referer": REF_BASE
+        };
+        var cookie = cookieHeader(cookies);
+        if (cookie) headers["Cookie"] = cookie;
+        return call("http.request", {
+          url: MODIFY_SONGLIST, method: "POST", headers: headers,
+          body: formBody(fields), timeoutMs: 30000
+        });
+      }).then(function (response) {
+        if (response.status < 200 || response.status >= 300) {
+          throw new Error("保存排序失败 HTTP " + response.status);
+        }
+        var result = parseLooseJson(response.body);
+        if (Number(result.code || 0) !== 0) {
+          throw new Error(result.msg || "保存排序失败(" + result.code + ")");
+        }
+        return { success: true };
+      });
+    });
+  });
+}
+
 /** 往目录里增删歌曲。写接口的 comm 必须是 WRITE_COMM,参数名也是驼峰的 dirId。 */
 function writeSonglist(dirId, songIds, add) {
   var songs = songIds.map(function (id) { return { songId: Number(id), songType: 0 }; });
@@ -1301,6 +1468,7 @@ module.exports = {
     account: account,
     like: like,
     playlistMutation: playlistMutation,
+    playlistReorder: playlistReorder,
     playlistCover: playlistCover,
     login: login,
     "ui.unblock": unblock.ui

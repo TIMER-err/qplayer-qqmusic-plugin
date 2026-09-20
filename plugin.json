@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "qq",
   "name": "QQ音乐",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "apiVersion": "1.0",
   "minHostVersion": "1.6.1",
   "entry": "src/main.js",
@@ -20,6 +20,7 @@
     "account",
     "like",
     "playlistMutation",
+    "playlistReorder",
     "playlistCover",
     "login"
   ],
