@@ -24,7 +24,7 @@ responsible for complying with the service terms and local law.
 | `playlistMutation` | create/delete playlists, add/remove songs, follow/unfollow |
 | `resolveStream` | M800/M500 MP3 stream URLs, **requires login** (anonymous vkeys were restricted from 2026) |
 | `lyrics` | plain LRC, works anonymously |
-| `login` / `account` | web login (QQ/WeChat), WeChat QR, pasted cookie |
+| `login` / `account` | QQ QR sign-in, web login (QQ/WeChat), pasted cookie |
 
 The settings page also carries a plugin-owned **source unlock** switch: when a track
 is unplayable on QQ Music, it attempts to match a stream URL from another source.
@@ -41,9 +41,10 @@ The public ABI and package format are documented in the
 
 Stream resolution requires login. Any of three methods:
 
+- **QQ QR sign-in** — scan with the QQ app's own scanner (a real QQ scan, no
+  WeChat involved).
 - **QQ / WeChat login** — the official QQ Music login page opens in-app and
   `qm_keyst` is captured on completion.
-- **WeChat QR** — confirm with WeChat to sign in to the linked QQ Music account.
 - **Pasted cookie** — take the cookie containing `musickey`/`qm_keyst` from the QQ
   Music client or website request headers and paste it in.
 

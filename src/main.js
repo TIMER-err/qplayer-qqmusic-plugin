@@ -11,14 +11,24 @@ var STREAM_HOST = "https://ws.stream.qqmusic.qq.com/";
 var REF_SEARCH = "https://y.qq.com/portal/search.html";
 var REF_BASE = "https://y.qq.com/";
 var REF_LYRIC = "https://y.qq.com/portal/player.html";
-// 微信扫码登录。QQ 号那条路(ptqrshow)用不了:它返回的是 PNG,二维码里编的
-// http://txz.qq.com/p?k=<服务端令牌> 只存在于图像内,响应头和 cookie 都拿不到,
-// 而宿主是拿 qrContent 字符串自己 QrMatrix.encode 出二维码的。
-var WX_APPID = "wx48db31d50e334801";
-var WX_QRCONNECT = "https://open.weixin.qq.com/connect/qrconnect";
-var WX_POLL = "https://lp.open.weixin.qq.com/connect/l/qrconnect";
-var WX_CONFIRM = "https://open.weixin.qq.com/connect/confirm?uuid=";
-var REF_WX = "https://open.weixin.qq.com/";
+// QQ 扫码登录(网页 QQ 互联那条老登录链路,ptqrshow/ptqrlogin/oauth2.0):
+// ptqrshow 直接返回一张 PNG,二维码内容只存在于图像像素里、response header 和
+// cookie 都不会告诉你编的是什么——但这恰恰是网页版一直以来的用法,浏览器就是把
+// 这张图原样 <img> 出来，手机 QQ 扫的也是这张图本身，不需要谁"解码"出文本。
+// 宿主原先的登录协议只认"插件给一段文本、宿主自己画二维码"这一种模式，所以这条
+// 路一直被跳过、退而求其次接了微信扫码；宿主加了 qrImageBase64 之后这里就能把
+// 图片原样交给宿主显示了。appid/daid/pt_3rd_aid 是 QQ 音乐网页版登录固定用的
+// 三个值，来自多个独立开源实现互相印证(网页 QQ 互联登录不是 QQ 音乐专属的，这
+// 三个数字标识的是"QQ 音乐"这个接入方)。
+var QQ_APPID = "716027609";
+var QQ_DAID = "383";
+var QQ_PT_3RD_AID = "100497308";
+var PTQRSHOW = "https://ssl.ptlogin2.qq.com/ptqrshow";
+var PTQRLOGIN = "https://ssl.ptlogin2.qq.com/ptqrlogin";
+var CHECK_SIG = "https://ssl.ptlogin2.graph.qq.com/check_sig";
+var OAUTH_AUTHORIZE = "https://graph.qq.com/oauth2.0/authorize";
+var REF_XUI = "https://xui.ptlogin2.qq.com/";
+var QQ_REDIRECT_URI = "https://y.qq.com/portal/wx_redirect.html?login_type=1&surl=https://y.qq.com/";
 var qrcDecrypt = require("./qrc").qrcDecrypt;
 // 账号自带的「我喜欢」歌单固定是 201 号目录,红心就是往它里面增删。
 var FAV_DIR_ID = 201;
@@ -92,6 +102,67 @@ function gtk(key) {
   var h = 5381;
   for (var i = 0; i < key.length; i++) h = (h + ((h << 5) + key.charCodeAt(i))) | 0;
   return h & 0x7fffffff;
+}
+
+/** Same shape as gtk() but seeded at 0 — this is the "ptqrtoken" flavour QQ's
+ *  ptqrlogin polling expects, derived from the qrsig cookie rather than a skey. */
+function hash33(str) {
+  var h = 0;
+  for (var i = 0; i < str.length; i++) h = (h + ((h << 5) + str.charCodeAt(i))) | 0;
+  return h & 0x7fffffff;
+}
+
+function uuid4() {
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
+    var r = (Math.random() * 16) | 0;
+    var v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+/** One named cookie out of the raw Set-Cookie lines http.request hands back. */
+function setCookieValue(setCookies, name) {
+  for (var i = 0; i < (setCookies || []).length; i++) {
+    var first = String(setCookies[i]).split(";")[0];
+    var eq = first.indexOf("=");
+    if (eq > 0 && first.slice(0, eq).trim() === name) return first.slice(eq + 1).trim();
+  }
+  return "";
+}
+
+/** Every Set-Cookie line joined into one Cookie header, so the next hop in a
+ *  redirect chain (which http.request never sees the cookie jar for on its
+ *  own — each call is stateless) can present them all at once. */
+function cookieHeaderFromSetCookies(setCookies) {
+  return (setCookies || []).map(function (line) {
+    return String(line).split(";")[0];
+  }).join("; ");
+}
+
+function formEncode(params) {
+  return Object.keys(params).map(function (key) {
+    return encodeURIComponent(key) + "=" + encodeURIComponent(String(params[key]));
+  }).join("&");
+}
+
+/**
+ * Low-level GET/POST that returns the whole http.request response (status,
+ * headers, setCookies, body, optionally bodyBase64) instead of unwrapping it —
+ * the QQ QR login chain needs the redirect Location header and the
+ * intermediate cookies that httpGetText/httpPostJson throw away.
+ */
+function httpRaw(method, url, opts) {
+  opts = opts || {};
+  var headers = { "User-Agent": opts.ua || UA_PC, "Referer": opts.referer || REF_BASE };
+  if (opts.cookie) headers["Cookie"] = opts.cookie;
+  if (opts.contentType) headers["Content-Type"] = opts.contentType;
+  return call("http.request", {
+    url: url, method: method, headers: headers,
+    body: opts.body,
+    includeBase64: !!opts.base64,
+    followRedirects: opts.followRedirects !== false,
+    timeoutMs: opts.timeoutMs || 15000
+  });
 }
 
 // ---- HTTP helpers ----------------------------------------------------------
@@ -1308,44 +1379,121 @@ function account() {
   });
 }
 
-/** 从微信登录页里取出本次会话的 uuid。 */
-function wxBeginChallenge() {
-  var query = "appid=" + WX_APPID
-    + "&redirect_uri=" + encodeURIComponent("https://y.qq.com/portal/wx_redirect.html?login_type=2&surl=https://y.qq.com/")
-    + "&response_type=code&scope=snsapi_login&state=STATE"
-    + "&href=" + encodeURIComponent("https://y.qq.com/mediastyle/music_v17/src/css/popup_wechat.css#wechat_redirect");
-  return httpGetText(WX_QRCONNECT + "?" + query, REF_WX, UA_PC).then(function (html) {
-    var match = /uuid=([A-Za-z0-9_-]+)/.exec(html);
-    if (!match) throw new Error("未能获取微信登录二维码");
-    var uuid = match[1];
-    return {
-      id: uuid, methodId: "wxqr", status: "waiting",
-      // 实测微信二维码图片编的就是这个串,所以宿主自己 encode 出来的码可以直接扫。
-      qrContent: WX_CONFIRM + uuid,
-      expiresAtMs: Date.now() + 5 * 60 * 1000
-    };
+/** ptqrshow returns the QR as a PNG directly; the qrsig cookie it also sets is
+ *  this whole challenge's identity — ptqrtoken and the poll below are both
+ *  derived from it, never from anything read out of the image itself. */
+function qqBeginChallenge() {
+  var query = formEncode({
+    appid: QQ_APPID, e: 2, l: "M", s: 3, d: 72, v: 4, t: Math.random(),
+    daid: QQ_DAID, pt_3rd_aid: QQ_PT_3RD_AID
+  });
+  return httpRaw("GET", PTQRSHOW + "?" + query, { referer: REF_XUI, base64: true })
+      .then(function (response) {
+        if (response.status < 200 || response.status >= 300) {
+          throw new Error("获取二维码失败: HTTP " + response.status);
+        }
+        var qrsig = setCookieValue(response.setCookies, "qrsig");
+        var png = String(response.bodyBase64 || "");
+        if (!qrsig || !png) throw new Error("未能获取登录二维码");
+        return {
+          id: qrsig, methodId: "qqqr", status: "waiting",
+          qrImageBase64: png,
+          expiresAtMs: Date.now() + 5 * 60 * 1000
+        };
+      });
+}
+
+/** ptqrlogin's body is old-school JSONP: ptuiCB('<code>','0','<url or empty>',
+ *  '0','',''). Codes: 0 done (url carries uin + ptsigx), 66 waiting, 67 scanned
+ *  awaiting confirmation, 65 expired, 68 refused on the phone. Anything else —
+ *  including a network hiccup, this is effectively a 20s long poll — is treated
+ *  as still waiting, same defensive default the old WeChat poll used. */
+function qqPollOnce(qrsig) {
+  var params = formEncode({
+    u1: "https://graph.qq.com/oauth2.0/login_jump", ptqrtoken: hash33(qrsig),
+    ptredirect: 0, h: 1, t: 1, g: 1, from_ui: 1, ptlang: 2052,
+    action: "0-0-" + Date.now(), js_ver: 20102616, js_type: 1, pt_uistyle: 40,
+    aid: QQ_APPID, daid: QQ_DAID, pt_3rd_aid: QQ_PT_3RD_AID, has_onekey: 1
+  });
+  return httpRaw("GET", PTQRLOGIN + "?" + params,
+      { referer: REF_XUI, cookie: "qrsig=" + qrsig, timeoutMs: 20000 }).then(function (response) {
+    var args = [];
+    var re = /'((?:\\.|[^'])*)'/g, m;
+    while ((m = re.exec(String(response.body || "")))) args.push(m[1]);
+    if (!args.length) return { status: "waiting" };
+    switch (args[0]) {
+      case "0": return { status: "success", url: args[2] || "" };
+      case "67": return { status: "scanned" };
+      case "65": return { status: "expired" };
+      case "68": return { status: "failed", message: "已在手机上取消登录" };
+      default: return { status: "waiting" };
+    }
   });
 }
 
-/** 用扫码换来的 code 换取 musickey,并落库成 cookie 形态 + 独立会话。 */
-function wxAuthorize(code) {
+/**
+ * Finishes a successful scan. check_sig mints the graph.qq.com session
+ * cookies (its own redirect is never followed — followRedirects: false — the
+ * redirect exists only to set them), oauth2.0/authorize exchanges that
+ * session for a one-time code (found in ITS OWN redirect's Location, same
+ * reason neither hop can auto-follow), and QQLogin turns the code into a QQ
+ * 音乐 musickey.
+ */
+function qqAuthorize(uin, ptsigx) {
+  var checkSigParams = formEncode({
+    uin: uin, pttype: 1, service: "ptqrlogin", nodirect: 0, ptsigx: ptsigx,
+    s_url: "https://graph.qq.com/oauth2.0/login_jump", ptlang: 2052, ptredirect: 100,
+    aid: QQ_APPID, daid: QQ_DAID, j_later: 0, low_login_hour: 0, regmaster: 0,
+    pt_login_type: 3, pt_aid: 0, pt_aaid: 16, pt_light: 0, pt_3rd_aid: QQ_PT_3RD_AID
+  });
+  return httpRaw("GET", CHECK_SIG + "?" + checkSigParams, { referer: REF_XUI, followRedirects: false })
+      .then(function (checkSigResp) {
+        var pSkey = setCookieValue(checkSigResp.setCookies, "p_skey");
+        if (!pSkey) throw new Error("登录会话建立失败(未取得 p_skey)");
+        var authorizeBody = formEncode({
+          response_type: "code", client_id: QQ_PT_3RD_AID, redirect_uri: QQ_REDIRECT_URI,
+          scope: "get_user_info,get_app_friends", state: "state", switch: "", from_ptlogin: 1,
+          src: 1, update_auth: 1, openapi: "1010_1030", g_tk: gtk(pSkey),
+          auth_time: Date.now(), ui: uuid4()
+        });
+        return httpRaw("POST", OAUTH_AUTHORIZE, {
+          referer: REF_XUI, followRedirects: false,
+          contentType: "application/x-www-form-urlencoded", body: authorizeBody,
+          cookie: cookieHeaderFromSetCookies(checkSigResp.setCookies)
+        });
+      }).then(function (authorizeResp) {
+        var location = headerValue(authorizeResp.headers, "Location");
+        var match = /[?&]code=([^&]+)/.exec(location || "");
+        if (!match) throw new Error("登录换取凭据失败(未取得 code)");
+        return qqExchangeCode(decodeURIComponent(match[1]));
+      });
+}
+
+function headerValue(headers, name) {
+  var key = Object.keys(headers || {}).filter(function (k) {
+    return k.toLowerCase() === name.toLowerCase();
+  })[0];
+  return key ? headers[key] : "";
+}
+
+/** Same musicu() exchange shape the old WeChat flow used, just pointed at
+ *  QQConnectLogin.LoginServer/QQLogin instead of music.login.LoginServer/Login
+ *  (and no strAppid — that was WeChat's OAuth app id, meaningless here). */
+function qqExchangeCode(code) {
   return httpPostJson(MUSICU, {
-    comm: { tmeLoginType: 1, format: "json", inCharset: "utf-8", outCharset: "utf-8" },
-    req_1: {
-      module: "music.login.LoginServer", method: "Login",
-      param: { code: code, strAppid: WX_APPID }
-    }
+    comm: { tmeLoginType: 2, format: "json", inCharset: "utf-8", outCharset: "utf-8" },
+    req_1: { module: "QQConnectLogin.LoginServer", method: "QQLogin", param: { code: code } }
   }, REF_BASE).then(function (body) {
     var data = body.req_1 && body.req_1.data || {};
     var key = String(data.musickey || "");
     var id = String(data.musicid || data.str_musicid || data.uin || "");
-    if (!key || !id) throw new Error("微信登录未返回有效凭据");
+    if (!key || !id) throw new Error("QQ 登录未返回有效凭据");
     // "cookies" 只放 cookie 形态的字段 —— musicu() 会把它整份拼进 Cookie 头。
     var cookies = {
       uin: id, musicid: id, musickey: key, qqmusic_key: key, qm_keyst: key
     };
     var session = {
-      loginType: Number(data.loginType || 1),
+      loginType: Number(data.loginType || 2),
       refreshToken: String(data.refresh_token || ""),
       unionid: String(data.unionid || ""),
       nick: String(data.nick || data.nickname || ""),
@@ -1367,17 +1515,20 @@ function login(args) {
   switch (args.operation) {
     case "methods":
       return [{
-        // QQ 号扫码只能走这里:ptqrshow 返回的是 PNG,二维码内容只存在于图像
-        // 里,而宿主要的是一串文本。网页登录则把整个官方登录页交给系统 WebView,
-        // QQ / 微信两种账号都能用。
+        // The real QQ-scan QR (ptqrshow) used to be unreachable here: it only
+        // returns a PNG, and the host's login protocol used to only accept a
+        // text string it would encode into a QR itself — so this used to fall
+        // back to "scan with WeChat" instead, which confused anyone who
+        // naturally reached for the QQ app. qrImageBase64 (below) is what
+        // closes that gap.
+        id: "qqqr", type: "qr", label: "QQ 扫码",
+        instructions: "打开手机 QQ,「扫一扫」这个二维码即可登录。"
+      }, {
         id: "web", type: "web", label: "QQ / 微信登录",
         instructions: "打开 QQ 音乐官方登录页，用 QQ 或微信登录后自动返回。",
         webUrl: "https://y.qq.com/portal/profile.html",
         cookieUrl: "https://y.qq.com",
         credentialCookieName: "qm_keyst"
-      }, {
-        id: "wxqr", type: "qr", label: "微信扫码",
-        instructions: "用微信扫码并确认，即可登录绑定了该微信的 QQ 音乐账号。"
       }, {
         id: "cookie", type: "credential", label: "Cookie",
         instructions: "在 QQ 音乐客户端/网页登录后,复制含 musickey 的 Cookie(如抓包 qqmusic.music.qq.com 请求头)。" +
@@ -1385,29 +1536,32 @@ function login(args) {
         credentialLabel: "QQ 音乐 Cookie"
       }];
     case "begin":
-      if (args.methodId !== "wxqr") throw new Error("该登录方式不需要创建挑战");
-      return wxBeginChallenge();
+      if (args.methodId !== "qqqr") throw new Error("该登录方式不需要创建挑战");
+      return qqBeginChallenge();
     case "poll": {
-      var uuid = String(args.challengeId || "");
-      if (!uuid) throw new Error("缺少登录挑战 ID");
-      var waiting = { id: uuid, methodId: "wxqr", status: "waiting" };
-      // 这是长轮询,未扫码时服务端会挂住约 15 秒才回 408;超时/网络抖动都按
-      // "还在等" 处理,不能报失败,否则界面会在正常等待期间弹错。
-      return httpGetText(WX_POLL + "?uuid=" + encodeURIComponent(uuid) + "&_=" + Date.now(),
-          REF_WX, UA_PC, 25000).then(function (text) {
-        var match = /window\.wx_errcode=(\d+);window\.wx_code='([^']*)'/.exec(text);
-        if (!match) return waiting;
-        var code = Number(match[1]);
-        var wxCode = match[2];
-        if (code === 404) return { id: uuid, methodId: "wxqr", status: "scanned" };
-        if (code === 402 || code === 403) return { id: uuid, methodId: "wxqr", status: "expired" };
-        if (code === 405 && wxCode) {
-          return wxAuthorize(wxCode).then(function (profile) {
-            return { id: uuid, methodId: "wxqr", status: "success", account: profile };
-          }, function (error) {
-            return { id: uuid, methodId: "wxqr", status: "failed",
-              message: String(error && error.message || error) };
-          });
+      var qrsig = String(args.challengeId || "");
+      if (!qrsig) throw new Error("缺少登录挑战 ID");
+      var waiting = { id: qrsig, methodId: "qqqr", status: "waiting" };
+      return qqPollOnce(qrsig).then(function (result) {
+        if (result.status === "scanned" || result.status === "expired") {
+          return { id: qrsig, methodId: "qqqr", status: result.status };
+        }
+        if (result.status === "failed") {
+          return { id: qrsig, methodId: "qqqr", status: "failed", message: result.message || "" };
+        }
+        if (result.status === "success") {
+          var uinMatch = /[?&]uin=([^&]+)/.exec(result.url || "");
+          var sigxMatch = /[?&]ptsigx=([^&]+)/.exec(result.url || "");
+          if (!uinMatch || !sigxMatch) {
+            return { id: qrsig, methodId: "qqqr", status: "failed", message: "登录响应缺少必要参数" };
+          }
+          return qqAuthorize(decodeURIComponent(uinMatch[1]), decodeURIComponent(sigxMatch[1]))
+              .then(function (profile) {
+                return { id: qrsig, methodId: "qqqr", status: "success", account: profile };
+              }, function (error) {
+                return { id: qrsig, methodId: "qqqr", status: "failed",
+                  message: String(error && error.message || error) };
+              });
         }
         return waiting;
       }, function () { return waiting; });
