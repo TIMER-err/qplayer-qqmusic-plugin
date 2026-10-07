@@ -714,6 +714,35 @@ function userPlaylists(args) {
   });
 }
 
+/**
+ * tid → {dirId, name, desc} for the cover-write path specifically — see
+ * playlistCover()'s own comment for why it needs name/desc back alongside
+ * dirId, unlike every other dirIdForTid() caller here.
+ */
+function playlistDirInfo(tid) {
+  var wanted = String(tid || "");
+  return requireUin().then(function (uin) {
+    if (!uin) throw new Error("请先登录 QQ 音乐");
+    return musicu({
+      mine: {
+        module: "music.musicasset.PlaylistBaseRead",
+        method: "GetPlaylistByUin",
+        param: { uin: uin }
+      }
+    }).then(function (body) {
+      var list = (body.mine && body.mine.data || {}).v_playlist || [];
+      for (var i = 0; i < list.length; i++) {
+        var item = list[i] || {};
+        if (String(item.tid || "") === wanted) {
+          return { dirId: Number(item.dirId || 0), name: String(item.dirName || ""),
+                    desc: String(item.desc || "") };
+        }
+      }
+      throw new Error("这个歌单不是你创建的，无法修改");
+    });
+  });
+}
+
 /** tid → 本地目录号(写接口只认 dirId)。 */
 function dirIdForTid(tid) {
   var wanted = String(tid || "");
@@ -775,73 +804,27 @@ function writeFailure(code, action) {
 // ---- 歌单封面 --------------------------------------------------------------
 //
 // QQ 这边分两步,且跟本插件其余请求都不一样:
-//   1. multipart 上传图片到 s.plcloud.music.qq.com,换回一个 imageurl;
+//   1. multipart 上传图片,换回一个 imageurl;
 //   2. EditPlaylist 把那个 URL 写进歌单的 dirNewPicUrl。
 // 也就是说 QQ 存的是图片地址而不是图片本身,跟网易云"上传拿 docId"的路子不同。
 //
-// 两个坑:该主机只有 http(https 握手直接失败),所以依赖 clearTextNetwork 权限;
-// 响应是 application/json,网页端那套 iframe 回调只是它自己的历史包袱,不用管。
+// 上传接口原来指向 s.plcloud.music.qq.com(http,依赖 clearTextNetwork),实测
+// EditPlaylist 那一步会以 80082 拒绝换回来的 imageurl。跟一个独立实现
+// (vtbmusic/VuterMusic-WPF 的 UploadAFile)逐字段对比后发现两处不一样：
+// 1) host/path 是 https://c.y.qq.com/splcloud/fcgi-bin/fcg_upload_image.fcg，
+//    不是 s.plcloud 那个；2) 表单里少了 crop/x/y/width/height/origin_size/png/
+//    picformat 这一整组字段——猜测服务端就是靠这些字段才认定"这是一次合法的
+//    封面上传"，缺了它们换回来的 imageurl 大概率是个 EditPlaylist 不认的格式。
+// 未经真实账号验证，仍需要实测确认。
+var UPLOAD_IMAGE = "https://c.y.qq.com/splcloud/fcgi-bin/fcg_upload_image.fcg";
 
-var UPLOAD_IMAGE = "http://s.plcloud.music.qq.com/fcgi-bin/fcg_upload_image.fcg";
-var B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/** latin1 字符串 -> base64。宿主跑的是 Rhino,没有 btoa。 */
-function toBase64(binary) {
-  var out = "";
-  var i = 0;
-  while (i < binary.length) {
-    var c1 = binary.charCodeAt(i++) & 0xff;
-    var has2 = i < binary.length;
-    var c2 = has2 ? binary.charCodeAt(i++) & 0xff : 0;
-    var has3 = i < binary.length;
-    var c3 = has3 ? binary.charCodeAt(i++) & 0xff : 0;
-    out += B64_ALPHABET.charAt(c1 >> 2);
-    out += B64_ALPHABET.charAt(((c1 & 3) << 4) | (c2 >> 4));
-    out += has2 ? B64_ALPHABET.charAt(((c2 & 15) << 2) | (c3 >> 6)) : "=";
-    out += has3 ? B64_ALPHABET.charAt(c3 & 63) : "=";
-  }
-  return out;
-}
-
-/** base64 -> latin1 字符串(每个字符正好一个字节),好跟文本段拼成 multipart。 */
-function fromBase64(text) {
-  var clean = "";
-  var raw = String(text || "");
-  for (var k = 0; k < raw.length; k++) {
-    if (B64_ALPHABET.indexOf(raw.charAt(k)) >= 0) clean += raw.charAt(k);
-  }
-  var out = "";
-  var i = 0;
-  while (i + 1 < clean.length) {
-    var e1 = B64_ALPHABET.indexOf(clean.charAt(i++));
-    var e2 = B64_ALPHABET.indexOf(clean.charAt(i++));
-    out += String.fromCharCode(((e1 << 2) | (e2 >> 4)) & 0xff);
-    if (i < clean.length) {
-      var e3 = B64_ALPHABET.indexOf(clean.charAt(i++));
-      out += String.fromCharCode((((e2 & 15) << 4) | (e3 >> 2)) & 0xff);
-      if (i < clean.length) {
-        var e4 = B64_ALPHABET.indexOf(clean.charAt(i++));
-        out += String.fromCharCode((((e3 & 3) << 6) | e4) & 0xff);
-      }
-    }
-  }
-  return out;
-}
-
-/** 组一个 multipart/form-data 体。字段值和文件名都只用 ASCII,省掉编码这一层。 */
-function multipartBody(boundary, fields, fileField, filename, binary) {
-  var body = "";
-  Object.keys(fields).forEach(function (name) {
-    body += "--" + boundary + "\r\n"
-      + "Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n"
-      + fields[name] + "\r\n";
-  });
-  body += "--" + boundary + "\r\n"
-    + "Content-Disposition: form-data; name=\"" + fileField + "\"; filename=\"" + filename + "\"\r\n"
-    + "Content-Type: image/jpeg\r\n\r\n"
-    + binary + "\r\n"
-    + "--" + boundary + "--\r\n";
-  return body;
+function coverUploadKind(args) {
+  var mime = String(args.mimeType || "").toLowerCase();
+  var name = String(args.filename || "").toLowerCase();
+  if (mime.indexOf("png") >= 0 || /\.png$/.test(name)) return { ext: "png", mime: "image/png", png: 1 };
+  if (mime.indexOf("webp") >= 0 || /\.webp$/.test(name)) return { ext: "webp", mime: "image/webp", png: 0 };
+  if (mime.indexOf("gif") >= 0 || /\.gif$/.test(name)) return { ext: "gif", mime: "image/gif", png: 0 };
+  return { ext: "jpg", mime: "image/jpeg", png: 0 };
 }
 
 /** 把存下来的 cookie 拼成请求头,跟 musicu() 用的是同一套。 */
@@ -858,54 +841,95 @@ function cookieHeader(cookies) {
 /**
  * 更换歌单封面。宿主把用户选的图片原样丢过来,由插件走完各家私有的上传流程。
  *
- * mask 固定 4 —— 位掩码里只有"封面"那一位。EditPlaylist 能一次改名字/简介/标签,
- * 但那要求把这些字段一并回传;只报封面这一位,名字和简介就不会被空值顺手清掉。
+ * mask 曾经固定用 4 —— 位掩码里只有"封面"那一位,图省事不用把名字/简介一并回传。
+ * 实测这条路 EditPlaylist 会以 80082 拒绝：QQ 音乐生态里能找到的参考实现
+ * (tlyanyu/multiPlatformMusicApi、YAQMC 的接口清单)在改这个接口时无一例外
+ * 把 dirNewName/dirNewDesc/dirNewPicUrl 一起传、mask 覆盖全部字段——没有先例
+ * 是单独只报封面这一位的。改成把现有名字/简介原样回填 + mask 7(名字+简介+
+ * 封面三位,不含标签那一位，标签维持不动)，而不是只报封面单独一位。
  */
 function playlistCover(args) {
   var imageBase64 = String(args.imageBase64 || "");
   if (!imageBase64) throw new Error("图片为空");
-  return Promise.all([dirIdForTid(args.playlistId), requireUin(), loadCookies()])
+  var kind = coverUploadKind(args);
+  return Promise.all([playlistDirInfo(args.playlistId), requireUin(), loadCookies()])
     .then(function (all) {
-      var dirId = all[0];
+      var dir = all[0];
       var uin = all[1];
       var cookies = all[2];
       if (!uin) throw new Error("请先登录 QQ 音乐");
-      var boundary = "----QPlayerCover" + Date.now();
+      // Confirmed live: EditPlaylist rejects dirId 201 ("我喜欢") with 80082
+      // regardless of what else is sent — upload succeeded, picUrl was a normal
+      // p.qpic.cn address, dirId/name were both correct. This is QQ 音乐 itself
+      // refusing to let the auto-generated favourites playlist's cover be
+      // touched (same reason it's excluded from deletable in ownPlaylistDto),
+      // not a parameter bug — fail fast with a real reason instead of a second
+      // round trip that was always going to come back 80082.
+      if (dir.dirId === FAV_DIR_ID) {
+        throw new Error("「我喜欢」是系统歌单，不支持更换封面");
+      }
+      // Referer/fields mirror a real client's edit-page request as closely as
+      // this plugin can (see the block comment above) — the server appears to
+      // key off more than just auth_appid+uin to accept the upload.
       var headers = {
-        "Content-Type": "multipart/form-data; boundary=" + boundary,
         "User-Agent": UA_PC,
-        "Referer": REF_BASE
+        "Referer": "https://y.qq.com/portal/mymusic_edit.html?dirid=" + dir.dirId
       };
       var cookie = cookieHeader(cookies);
       if (cookie) headers["Cookie"] = cookie;
-      var body = multipartBody(boundary, {
-        auth_appid: "music_cover",
-        parentid: "/",
-        fileid: String(Date.now()),
-        uin: String(uin)
-      }, "data", "cover.jpg", fromBase64(imageBase64));
+      // Multipart is assembled in the host from the original image bytes.
+      // Building it here meant decoding the file into a JS string and
+      // re-encoding the whole form — a multi-megabyte cover froze the UI.
       return call("http.request", {
         url: UPLOAD_IMAGE,
         method: "POST",
         headers: headers,
-        bodyBase64: toBase64(body),
+        multipart: {
+          fields: {
+            auth_appid: "music_cover",
+            parentid: "/",
+            fileid: String(Date.now()),
+            uin: String(uin),
+            crop: "0",
+            x: "0",
+            y: "0",
+            width: "0",
+            height: "0",
+            origin_size: "1",
+            png: String(kind.png),
+            picformat: kind.ext
+          },
+          file: {
+            field: "data",
+            filename: "cover." + kind.ext,
+            mimeType: kind.mime,
+            bodyBase64: imageBase64
+          }
+        },
         timeoutMs: 30000
       }).then(function (response) {
         if (response.status < 200 || response.status >= 300) {
           throw new Error("上传封面失败 HTTP " + response.status);
         }
         var data;
-        try { data = JSON.parse(response.body || "{}"); }
-        catch (_) { throw new Error("上传封面失败：响应无法解析"); }
-        var imageUrl = String(data.imageurl || "");
-        if (Number(data.retcode || 0) !== 0 || !imageUrl) {
+        try { data = parseLooseJson(response.body); }
+        catch (_) {
+          throw new Error("上传封面失败：响应无法解析");
+        }
+        var nested = data.data || {};
+        var imageUrl = String(data.imageurl || data.picurl || nested.imageurl || nested.picurl || "");
+        if (Number(data.retcode || data.code || 0) !== 0 || !imageUrl) {
           throw new Error(data.msg || data.message || "上传封面失败");
         }
         return musicu({
           req: {
             module: "music.musicasset.PlaylistBaseWrite",
             method: "EditPlaylist",
-            param: { dirId: Number(dirId), mask: 4, dirNewPicUrl: secureUrl(imageUrl) }
+            param: {
+              dirId: dir.dirId, mask: 7,
+              dirNewName: dir.name, dirNewDesc: dir.desc,
+              dirNewPicUrl: secureUrl(imageUrl)
+            }
           }
         }, WRITE_COMM).then(function (result) {
           var node = result.req || {};
@@ -1382,6 +1406,17 @@ function account() {
 /** ptqrshow returns the QR as a PNG directly; the qrsig cookie it also sets is
  *  this whole challenge's identity — ptqrtoken and the poll below are both
  *  derived from it, never from anything read out of the image itself. */
+function qqAppUrl(qrsig) {
+  return "wtloginmqq://ptlogin/qlogin?" + formEncode({
+    ptopt: 1,
+    appid: QQ_APPID,
+    daid: QQ_DAID,
+    pt_3rd_aid: QQ_PT_3RD_AID,
+    ptqrtoken: hash33(qrsig),
+    u1: "https://graph.qq.com/oauth2.0/login_jump"
+  });
+}
+
 function qqBeginChallenge() {
   var query = formEncode({
     appid: QQ_APPID, e: 2, l: "M", s: 3, d: 72, v: 4, t: Math.random(),
@@ -1398,6 +1433,8 @@ function qqBeginChallenge() {
         return {
           id: qrsig, methodId: "qqqr", status: "waiting",
           qrImageBase64: png,
+          appUrl: qqAppUrl(qrsig),
+          appLabel: "打开 QQ",
           expiresAtMs: Date.now() + 5 * 60 * 1000
         };
       });
@@ -1513,8 +1550,8 @@ function qqExchangeCode(code) {
 
 function login(args) {
   switch (args.operation) {
-    case "methods":
-      return [{
+    case "methods": {
+      var methods = [{
         // The real QQ-scan QR (ptqrshow) used to be unreachable here: it only
         // returns a PNG, and the host's login protocol used to only accept a
         // text string it would encode into a QR itself — so this used to fall
@@ -1535,8 +1572,19 @@ function login(args) {
           "插件会提取 musickey 与 uin 并加密保存,用于 Vkey 播放。",
         credentialLabel: "QQ 音乐 Cookie"
       }];
+      if (args && args.platform === "android") {
+        methods.unshift({
+          id: "qqapp", type: "app", label: "QQ 一键登录",
+          appLabel: "打开 QQ",
+          instructions: "将跳转到手机 QQ 确认登录。请先安装 QQ。"
+        });
+      }
+      return methods;
+    }
     case "begin":
-      if (args.methodId !== "qqqr") throw new Error("该登录方式不需要创建挑战");
+      if (args.methodId !== "qqqr" && args.methodId !== "qqapp") {
+        throw new Error("该登录方式不需要创建挑战");
+      }
       return qqBeginChallenge();
     case "poll": {
       var qrsig = String(args.challengeId || "");
