@@ -52,7 +52,11 @@
     "search.kuwo.cn",
     "mobi.kuwo.cn",
     "bd-api.kuwo.cn",
+    "bd-er.kuwo.cn",
+    "*.bd-er.kuwo.cn",
     "*.kuwo.cn",
+    "*.joox.com",
+    "*.tencentmusic.com",
     "music.126.net",
     "*.music.126.net"
   ],

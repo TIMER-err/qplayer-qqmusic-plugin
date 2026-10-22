@@ -27,8 +27,9 @@ responsible for complying with the service terms and local law.
 | `login` / `account` | QQ QR sign-in, web login (QQ/WeChat), pasted cookie |
 
 The settings page also carries a plugin-owned **source unlock** switch: when a track
-is unplayable on QQ Music, it attempts to match a stream URL from another source.
-The entry is declared by the plugin and rendered by QPlayer.
+is unplayable or VIP-only on QQ Music, it matches a full stream from another source.
+Right-click **Cache song** uses that unlocked URL, so any QQ track can be downloaded
+into QPlayer's cache. The entry is declared by the plugin and rendered by QPlayer.
 
 Two implementation notes: write endpoints (favourites, playlist edits) must send
 `ct=26` in `comm` — `ct=24` is rejected by the server with `80105`/`1101` — and the

@@ -224,6 +224,15 @@ function firstUrl(promises) {
  * bodian/kuwo 走的是酷我曲库,QQ 上的会员大户(如周杰伦)基本都在;
  * gdstudio 主要靠网易曲库,放最后兜底。
  */
+function cacheableStream(url) {
+  return {
+    url: String(url),
+    headers: {}, mimeType: "",
+    expiresAtMs: Date.now() + 15 * 60 * 1000,
+    trial: false, cacheable: true
+  };
+}
+
 function resolve(options) {
   var loadSong = options.songDetails;
   return enabled().then(function (on) {
@@ -250,12 +259,7 @@ function resolve(options) {
   }).then(function (url) {
     if (!url) return null;
     notify("已为该歌曲自动换源");
-    return {
-      url: String(url),
-      headers: {}, mimeType: "",
-      expiresAtMs: Date.now() + 15 * 60 * 1000,
-      trial: false, cacheable: true
-    };
+    return cacheableStream(url);
   });
 }
 
@@ -271,7 +275,7 @@ function ui(args) {
       icon: "lock_open",
       body: [
         {type: "text", style: "body",
-          text: "QQ 官方无版权、或需要会员而拿不到播放地址时，自动依次尝试其他音源。"},
+          text: "官方无版权、需要会员、或右键缓存拿不到完整音轨时，自动换源并给出可下载直链。"},
         {type: "text", style: "caption", text: on ? "当前：已开启" : "当前：已关闭"},
         {type: "row", items: [
           {type: "button", id: "enable", label: "开启", style: on ? "filled" : "outlined"},
