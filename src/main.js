@@ -1296,11 +1296,31 @@ function albumDetails(args) {
   });
 }
 
+function streamFilenames(mid, quality) {
+  var m500 = "M500" + mid + mid + ".mp3";
+  var m800 = "M800" + mid + mid + ".mp3";
+  var f000 = "F000" + mid + mid + ".flac";
+  var q = String(quality || "exhigh");
+  if (q === "standard") return [m500, m800];
+  if (q === "lossless" || q === "hires") return [f000, m800, m500];
+  return [m800, m500];
+}
+
+function streamMime(filename) {
+  return String(filename || "").indexOf("F000") === 0 ? "audio/flac" : "audio/mpeg";
+}
+
 function resolveStream(args) {
   var mid = String(args.id || "");
   if (!mid) throw new Error("缺少歌曲 ID");
   var guid = String(Math.floor(1000000000 + Math.random() * 9000000000));
-  var filenames = ["M800" + mid + mid + ".mp3", "M500" + mid + mid + ".mp3"];
+  var filenames = streamFilenames(mid, args.quality);
+  var songmid = [];
+  var songtype = [];
+  for (var n = 0; n < filenames.length; n++) {
+    songmid.push(mid);
+    songtype.push(0);
+  }
   return loadCookies().then(function (cookies) {
     // 登录态下 param.uin 必须是真实 uin;写死 "0" 会让 vkey 服务按匿名处理,
     // 于是连会员歌也拿不到 purl。
@@ -1310,7 +1330,7 @@ function resolveStream(args) {
         module: "music.vkey.GetVkey",
         method: "UrlGetVkey",
         param: {
-          guid: guid, songmid: [mid, mid], songtype: [0, 0],
+          guid: guid, songmid: songmid, songtype: songtype,
           uin: uin, loginflag: 1, platform: "20", filename: filenames
         }
       }
@@ -1327,7 +1347,7 @@ function resolveStream(args) {
         var info = infos[j] || {};
         if (String(info.filename) === filenames[i] && info.purl) {
           return {
-            url: host + info.purl, headers: {}, mimeType: "audio/mpeg",
+            url: host + info.purl, headers: {}, mimeType: streamMime(filenames[i]),
             expiresAtMs: Date.now() + 15 * 60 * 1000, trial: false, cacheable: true
           };
         }
