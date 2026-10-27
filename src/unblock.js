@@ -46,24 +46,63 @@ function notify(message) {
 }
 
 function normalizeName(name) {
-  return text(name).toLowerCase().replace(/[（(][^）)]*[）)]/g, "").trim();
+  return text(name).toLowerCase()
+      .replace(/[（(【\[][^）)】\]]*[）)】\]]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
 }
 
 function normalizeArtist(artist) {
   return text(artist).toLowerCase().replace(/[&/、，,;；]/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function isMatch(resultName, resultArtist, wantName, wantArtist) {
+function durationMsOf(raw) {
+  var n = Number(raw);
+  if (!n || n < 0) return 0;
+  return n > 10000 ? n : n * 1000;
+}
+
+function isMatch(resultName, resultArtist, wantName, wantArtist, wantMs, gotMs) {
   var rn = normalizeName(resultName);
-  if (!rn) return false;
   var on = normalizeName(wantName);
-  if (on && rn.indexOf(on) < 0 && on.indexOf(rn) < 0) return false;
-  if (resultArtist && wantArtist) {
-    var ra = normalizeArtist(resultArtist);
+  if (!rn || !on) return false;
+  var nameOk = Math.min(rn.length, on.length) <= 4
+      ? rn === on
+      : (rn.indexOf(on) >= 0 || on.indexOf(rn) >= 0);
+  if (!nameOk) return false;
+  if (wantArtist) {
     var oa = normalizeArtist(wantArtist);
-    if (ra && oa && ra.indexOf(oa) < 0 && oa.indexOf(ra) < 0) return false;
+    var ra = normalizeArtist(resultArtist);
+    if (oa) {
+      if (!ra) return false;
+      if (ra.indexOf(oa) < 0 && oa.indexOf(ra) < 0) return false;
+    }
   }
+  if (wantMs && gotMs && Math.abs(wantMs - gotMs) > 8000) return false;
   return true;
+}
+
+function pickMatch(list, nameOf, artistOf, durationOf, wantName, wantArtist, wantMs) {
+  var best = null;
+  var bestScore = -1;
+  for (var i = 0; i < (list || []).length; i++) {
+    var item = list[i] || {};
+    var gotName = nameOf(item);
+    var gotArtist = artistOf(item);
+    var gotMs = durationMsOf(durationOf(item));
+    if (!isMatch(gotName, gotArtist, wantName, wantArtist, wantMs, gotMs)) continue;
+    var score = 0;
+    if (normalizeName(gotName) === normalizeName(wantName)) score += 100;
+    if (wantMs && gotMs && Math.abs(wantMs - gotMs) <= 3000) score += 50;
+    else if (wantMs && gotMs) score += 20;
+    if (wantArtist && normalizeArtist(gotArtist) === normalizeArtist(wantArtist)) score += 30;
+    score -= i;
+    if (score > bestScore) {
+      bestScore = score;
+      best = item;
+    }
+  }
+  return best;
 }
 
 /**
@@ -71,40 +110,41 @@ function isMatch(resultName, resultArtist, wantName, wantArtist) {
  * 所以这里先用关键词搜出对应 id 再取址。source=tencent/qq 均不受支持,
  * 实测可用的是 netease 与 joox(kuwo 能搜到但取址返回空)。
  */
-function gdstudioOne(source, keyword, songName, artist) {
+function gdstudioOne(source, keyword, songName, artist, wantMs) {
   return httpGet(GD_API + "?types=search&source=" + source
       + "&name=" + encodeURIComponent(keyword) + "&count=20&pages=1",
       {"User-Agent": "qplayer/1.0"}).then(function (body) {
     var list = parseJson(body);
     if (!list || !list.length) return null;
-    for (var i = 0; i < list.length; i++) {
-      var item = list[i] || {};
-      var names = item.artist;
-      var credited = Object.prototype.toString.call(names) === "[object Array]"
-          ? names.join(" ") : text(names);
-      if (!isMatch(item.name, credited, songName, artist)) continue;
-      if (!item.id) continue;
-      return httpGet(GD_API + "?types=url&source=" + source
-          + "&id=" + encodeURIComponent(String(item.id)) + "&br=320",
-          {"User-Agent": "qplayer/1.0"}).then(function (urlBody) {
-        var obj = parseJson(urlBody);
-        var url = obj && obj.url;
-        return url ? String(url) : null;
-      });
-    }
-    return null;
+    var item = pickMatch(list,
+        function (row) { return row.name; },
+        function (row) {
+          var names = row.artist;
+          return Object.prototype.toString.call(names) === "[object Array]"
+              ? names.join(" ") : text(names);
+        },
+        function (row) { return row.duration || row.interval; },
+        songName, artist, wantMs);
+    if (!item || !item.id) return null;
+    return httpGet(GD_API + "?types=url&source=" + source
+        + "&id=" + encodeURIComponent(String(item.id)) + "&br=320",
+        {"User-Agent": "qplayer/1.0"}).then(function (urlBody) {
+      var obj = parseJson(urlBody);
+      var url = obj && obj.url;
+      return url ? String(url) : null;
+    });
   }, function () { return null; });
 }
 
-function gdstudio(keyword, songName, artist) {
+function gdstudio(keyword, songName, artist, wantMs) {
   if (!keyword) return Promise.resolve(null);
   return firstUrl([
-    function () { return gdstudioOne("netease", keyword, songName, artist); },
-    function () { return gdstudioOne("joox", keyword, songName, artist); }
+    function () { return gdstudioOne("netease", keyword, songName, artist, wantMs); },
+    function () { return gdstudioOne("joox", keyword, songName, artist, wantMs); }
   ]);
 }
 
-function kuwoSearchRid(keyword, songName, artist) {
+function kuwoSearchRid(keyword, songName, artist, wantMs) {
   var url = "http://search.kuwo.cn/r.s?&correct=1&stype=comprehensive&encoding=utf8"
       + "&rformat=json&mobi=1&show_copyright_off=1&searchapi=6&all="
       + encodeURIComponent(keyword).replace(/%20/g, "%20");
@@ -114,21 +154,21 @@ function kuwoSearchRid(keyword, songName, artist) {
     if (!content || content.length < 2) return null;
     var list = content[1] && content[1].musicpage && content[1].musicpage.abslist;
     if (!list || !list.length) return null;
-    for (var i = 0; i < list.length; i++) {
-      var item = list[i] || {};
-      var musicRid = text(item.MUSICRID);
-      if (!musicRid) continue;
-      if (isMatch(item.SONGNAME, item.ARTIST, songName, artist)) {
-        return musicRid.indexOf("MUSIC_") === 0 ? musicRid.slice(6) : musicRid;
-      }
-    }
-    return null;
+    var item = pickMatch(list,
+        function (row) { return row.SONGNAME; },
+        function (row) { return row.ARTIST; },
+        function (row) { return row.DURATION || row.duration; },
+        songName, artist, wantMs);
+    if (!item) return null;
+    var musicRid = text(item.MUSICRID);
+    if (!musicRid) return null;
+    return musicRid.indexOf("MUSIC_") === 0 ? musicRid.slice(6) : musicRid;
   }, function () { return null; });
 }
 
-function kuwo(keyword, songName, artist) {
+function kuwo(keyword, songName, artist, wantMs) {
   if (!keyword) return Promise.resolve(null);
-  return kuwoSearchRid(keyword, songName, artist).then(function (rid) {
+  return kuwoSearchRid(keyword, songName, artist, wantMs).then(function (rid) {
     if (!rid) return null;
     var query = "corp=kuwo&source=" + KUWO_PACKAGE + "&p2p=1&type=convert_url2&sig=0&format=mp3&rid=" + rid;
     return httpGet("http://mobi.kuwo.cn/mobi.s?f=kuwo&q=" + encryptQuery(query), {
@@ -140,7 +180,7 @@ function kuwo(keyword, songName, artist) {
   }, function () { return null; });
 }
 
-function bodianSearchRid(keyword, songName, artist) {
+function bodianSearchRid(keyword, songName, artist, wantMs) {
   var kw = text(keyword).replace(" - ", " ");
   var url = "http://search.kuwo.cn/r.s?&correct=1&vipver=1&stype=comprehensive&encoding=utf8"
       + "&rformat=json&mobi=1&show_copyright_off=1&searchapi=6&all="
@@ -151,16 +191,16 @@ function bodianSearchRid(keyword, songName, artist) {
     if (!content || content.length < 2) return null;
     var list = content[1] && content[1].musicpage && content[1].musicpage.abslist;
     if (!list || !list.length) return null;
-    for (var i = 0; i < list.length; i++) {
-      var item = list[i] || {};
-      var musicRid = text(item.MUSICRID);
-      if (!musicRid) continue;
-      if (isMatch(item.SONGNAME, item.ARTIST, songName, artist)) {
-        var at = musicRid.lastIndexOf("_");
-        return at >= 0 ? musicRid.slice(at + 1) : musicRid;
-      }
-    }
-    return null;
+    var item = pickMatch(list,
+        function (row) { return row.SONGNAME; },
+        function (row) { return row.ARTIST; },
+        function (row) { return row.DURATION || row.duration; },
+        songName, artist, wantMs);
+    if (!item) return null;
+    var musicRid = text(item.MUSICRID);
+    if (!musicRid) return null;
+    var at = musicRid.lastIndexOf("_");
+    return at >= 0 ? musicRid.slice(at + 1) : musicRid;
   }, function () { return null; });
 }
 
@@ -184,9 +224,9 @@ function bodianHeaders() {
   };
 }
 
-function bodian(keyword, songName, artist) {
+function bodian(keyword, songName, artist, wantMs) {
   if (!keyword) return Promise.resolve(null);
-  return bodianSearchRid(keyword, songName, artist).then(function (rid) {
+  return bodianSearchRid(keyword, songName, artist, wantMs).then(function (rid) {
     if (!rid) return null;
     var adUrl = "http://bd-api.kuwo.cn/api/service/advert/watch"
         + "?uid=-1&token=&timestamp=1724306124436&sign=15a676d66285117ad714e8c8371691da";
@@ -249,11 +289,12 @@ function resolve(options) {
         artist = parts.join(" ");
       }
       if (!name) return null;
+      var wantMs = Number(song.durationMs || 0);
       var keyword = artist ? name + "-" + artist : name;
       return firstUrl([
-        function () { return bodian(keyword, name, artist); },
-        function () { return kuwo(keyword, name, artist); },
-        function () { return gdstudio(keyword, name, artist); }
+        function () { return bodian(keyword, name, artist, wantMs); },
+        function () { return kuwo(keyword, name, artist, wantMs); },
+        function () { return gdstudio(keyword, name, artist, wantMs); }
       ]);
     }, function () { return null; });
   }).then(function (url) {

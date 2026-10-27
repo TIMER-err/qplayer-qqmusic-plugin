@@ -1365,6 +1365,12 @@ function resolveStream(args) {
           : "需要登录:请到设置 → QQ音乐 → 登录(粘贴 QQ 音乐 Cookie)后播放");
       });
     });
+  }, function (error) {
+    var text = error && error.message ? String(error.message) : String(error || "");
+    if (/timed?\s*out|timeout|connect|reset|unreachable|network|ECONN|ETIMEDOUT|socket/i.test(text)) {
+      throw new Error("官方音源暂时连不上,请稍后重试");
+    }
+    throw error;
   });
 }
 
