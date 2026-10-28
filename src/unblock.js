@@ -52,8 +52,62 @@ function normalizeName(name) {
       .trim();
 }
 
+function bracketExtras(name) {
+  var extras = [];
+  text(name).replace(/[（(【\[]([^）)】\]]*)[）)】\]]/g, function (_, inner) {
+    extras.push(String(inner || "").toLowerCase().replace(/\s+/g, ""));
+    return "";
+  });
+  return extras;
+}
+
+function isDerivativeExtra(extra) {
+  return /伴奏|纯音乐|instrumental|\binstr\b|dj|remix|cover|翻唱|现场|live|加速|夜芯|环绕/.test(extra);
+}
+
+function hasDerivativeExtra(name) {
+  var extras = bracketExtras(name);
+  var i;
+  for (i = 0; i < extras.length; i++) {
+    if (isDerivativeExtra(extras[i])) return true;
+  }
+  return false;
+}
+
+function extrasCompatible(wantName, resultName) {
+  return hasDerivativeExtra(wantName) === hasDerivativeExtra(resultName);
+}
+
 function normalizeArtist(artist) {
   return text(artist).toLowerCase().replace(/[&/、，,;；]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function artistTokens(artist) {
+  var parts = normalizeArtist(artist).split(" ");
+  var out = [];
+  var i;
+  for (i = 0; i < parts.length; i++) {
+    if (parts[i]) out.push(parts[i]);
+  }
+  return out;
+}
+
+function artistsOverlap(want, got) {
+  var oa = String(want || "");
+  var ra = String(got || "");
+  if (!oa || !ra) return false;
+  if (ra.indexOf(oa) >= 0 || oa.indexOf(ra) >= 0) return true;
+  var wantTokens = artistTokens(oa);
+  var gotTokens = artistTokens(ra);
+  var i, j;
+  for (i = 0; i < wantTokens.length; i++) {
+    for (j = 0; j < gotTokens.length; j++) {
+      var a = wantTokens[i];
+      var b = gotTokens[j];
+      if (a === b || a.indexOf(b) >= 0 || b.indexOf(a) >= 0) return true;
+    }
+  }
+  return false;
 }
 
 function durationMsOf(raw) {
@@ -65,20 +119,17 @@ function durationMsOf(raw) {
 function isMatch(resultName, resultArtist, wantName, wantArtist, wantMs, gotMs) {
   var rn = normalizeName(resultName);
   var on = normalizeName(wantName);
-  if (!rn || !on) return false;
-  var nameOk = Math.min(rn.length, on.length) <= 4
-      ? rn === on
-      : (rn.indexOf(on) >= 0 || on.indexOf(rn) >= 0);
-  if (!nameOk) return false;
-  if (wantArtist) {
-    var oa = normalizeArtist(wantArtist);
-    var ra = normalizeArtist(resultArtist);
-    if (oa) {
-      if (!ra) return false;
-      if (ra.indexOf(oa) < 0 && oa.indexOf(ra) < 0) return false;
-    }
+  if (!rn || !on || rn !== on) return false;
+  if (!extrasCompatible(wantName, resultName)) return false;
+  var oa = normalizeArtist(wantArtist);
+  var ra = normalizeArtist(resultArtist);
+  if (oa) {
+    if (!ra) return false;
+    if (!artistsOverlap(oa, ra)) return false;
   }
   if (wantMs && gotMs && Math.abs(wantMs - gotMs) > 8000) return false;
+  // 缺时长且没有歌手时放弃,避免同名覆盖把别人的歌当成原曲。
+  if (!oa && wantMs && !gotMs) return false;
   return true;
 }
 
