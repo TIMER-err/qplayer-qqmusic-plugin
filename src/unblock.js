@@ -48,34 +48,33 @@ function notify(message) {
 function normalizeName(name) {
   return text(name).toLowerCase()
       .replace(/[（(【\[][^）)】\]]*[）)】\]]/g, "")
+      .replace(/\s+-\s+[\s\S]*$/, "")
       .replace(/\s+/g, " ")
       .trim();
 }
 
-function bracketExtras(name) {
+// 比较版本限定语本身，而不是只判断两边是否都含 DJ/live 等关键词。
+// 未知限定语也要保留：原版不能匹配「宿命版」，DJ 名龙版也不能匹配 DJ 哭包版。
+function versionKey(name) {
   var extras = [];
+  function add(inner) {
+    var value = text(inner).toLowerCase().trim();
+    if (/^(feat\.?|ft\.?|featuring|with)\s/.test(value)) return;
+    value = value.replace(/[\s._-]+/g, "");
+    if (!value || /^(remastered?|explicit|clean|hq|高音质|高音質|完整版本)$/.test(value)) return;
+    extras.push(value);
+  }
   text(name).replace(/[（(【\[]([^）)】\]]*)[）)】\]]/g, function (_, inner) {
-    extras.push(String(inner || "").toLowerCase().replace(/\s+/g, ""));
+    add(inner);
     return "";
   });
-  return extras;
-}
-
-function isDerivativeExtra(extra) {
-  return /伴奏|纯音乐|instrumental|\binstr\b|dj|remix|cover|翻唱|现场|live|加速|夜芯|环绕/.test(extra);
-}
-
-function hasDerivativeExtra(name) {
-  var extras = bracketExtras(name);
-  var i;
-  for (i = 0; i < extras.length; i++) {
-    if (isDerivativeExtra(extras[i])) return true;
-  }
-  return false;
+  var dashed = text(name).split(/\s+-\s+/);
+  for (var i = 1; i < dashed.length; i++) add(dashed[i]);
+  return extras.sort().join("|");
 }
 
 function extrasCompatible(wantName, resultName) {
-  return hasDerivativeExtra(wantName) === hasDerivativeExtra(resultName);
+  return versionKey(wantName) === versionKey(resultName);
 }
 
 function normalizeArtist(artist) {
