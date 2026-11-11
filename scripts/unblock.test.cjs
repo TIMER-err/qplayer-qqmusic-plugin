@@ -28,6 +28,20 @@ test("real search order selects original rather than first DJ result", () => {
   assert.equal(pick(load(), candidates).MUSICRID, "MUSIC_145215536");
 });
 
+test("春庭雪 real candidates reject translated remix and slowed DJ versions", () => {
+  const context = load();
+  const list = [
+    {SONGNAME: "Xuân Đình Tuyết / 春庭雪 (Hiên Kun Remix)",
+      ARTIST: "Hiên Kun's&等什麼君&Đẳng Thập Yêu Quân&等什么君&Hiên Kun", DURATION: "226", MUSICRID: "MUSIC_476765578"},
+    {SONGNAME: "春庭雪 (0.9x版DJ Wave版)", ARTIST: "邓寓君(等什么君)", DURATION: "422", MUSICRID: "MUSIC_387471571"},
+    {SONGNAME: "春庭雪", ARTIST: "邓寓君(等什么君)", DURATION: "240", MUSICRID: "MUSIC_144914539"}
+  ];
+  const select = rows => context.pickMatch(rows, x => x.SONGNAME, x => x.ARTIST,
+      x => x.DURATION, "春庭雪", "等什么君", 240000);
+  assert.equal(select(list).MUSICRID, "MUSIC_144914539");
+  assert.equal(select(list.slice(0, 2)), null);
+});
+
 test("never substitute a derivative when original is absent", () => {
   const context = load();
   for (const suffix of ["DJ名龙版", "DJ哭包版", "宿命版", "治愈版", "KTV版伴奏", "Live", "Remix"]) {
