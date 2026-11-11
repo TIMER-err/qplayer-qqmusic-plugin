@@ -1432,17 +1432,6 @@ function account() {
 /** ptqrshow returns the QR as a PNG directly; the qrsig cookie it also sets is
  *  this whole challenge's identity — ptqrtoken and the poll below are both
  *  derived from it, never from anything read out of the image itself. */
-function qqAppUrl(qrsig) {
-  return "wtloginmqq://ptlogin/qlogin?" + formEncode({
-    ptopt: 1,
-    appid: QQ_APPID,
-    daid: QQ_DAID,
-    pt_3rd_aid: QQ_PT_3RD_AID,
-    ptqrtoken: hash33(qrsig),
-    u1: "https://graph.qq.com/oauth2.0/login_jump"
-  });
-}
-
 function qqBeginChallenge() {
   var query = formEncode({
     appid: QQ_APPID, e: 2, l: "M", s: 3, d: 72, v: 4, t: Math.random(),
@@ -1459,8 +1448,6 @@ function qqBeginChallenge() {
         return {
           id: qrsig, methodId: "qqqr", status: "waiting",
           qrImageBase64: png,
-          appUrl: qqAppUrl(qrsig),
-          appLabel: "打开 QQ",
           expiresAtMs: Date.now() + 5 * 60 * 1000
         };
       });
@@ -1577,7 +1564,7 @@ function qqExchangeCode(code) {
 function login(args) {
   switch (args.operation) {
     case "methods": {
-      var methods = [{
+      return [{
         // The real QQ-scan QR (ptqrshow) used to be unreachable here: it only
         // returns a PNG, and the host's login protocol used to only accept a
         // text string it would encode into a QR itself — so this used to fall
@@ -1598,17 +1585,9 @@ function login(args) {
           "插件会提取 musickey 与 uin 并加密保存,用于 Vkey 播放。",
         credentialLabel: "QQ 音乐 Cookie"
       }];
-      if (args && args.platform === "android") {
-        methods.unshift({
-          id: "qqapp", type: "app", label: "QQ 一键登录",
-          appLabel: "打开 QQ",
-          instructions: "将跳转到手机 QQ 确认登录。请先安装 QQ。"
-        });
-      }
-      return methods;
     }
     case "begin":
-      if (args.methodId !== "qqqr" && args.methodId !== "qqapp") {
+      if (args.methodId !== "qqqr") {
         throw new Error("该登录方式不需要创建挑战");
       }
       return qqBeginChallenge();

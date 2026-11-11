@@ -45,6 +45,8 @@ QPlayer 核心之外。
 - **粘贴 Cookie**：从 QQ 音乐客户端或网页登录后的请求头中取出含 `musickey`/
   `qm_keyst` 的 Cookie 粘贴进来。
 
+不提供跳转 QQ App 的一键登录。
+
 插件仅提取播放与账号所需字段，通过 QPlayer 按插件隔离的加密凭据库保存；Vkey 请求使用
 真实 uin 与 musickey。Cookie 不应提交到源码、Issue、日志或构建产物中。
 

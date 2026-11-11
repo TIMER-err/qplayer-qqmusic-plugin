@@ -49,6 +49,8 @@ Stream resolution requires login. Any of three methods:
 - **Pasted cookie** — take the cookie containing `musickey`/`qm_keyst` from the QQ
   Music client or website request headers and paste it in.
 
+App-launch login is not available.
+
 The plugin extracts only the fields needed for playback and account display and
 stores them through QPlayer's namespaced encrypted vault; vkey requests use the real
 uin and musickey. Cookies must not be committed to source, issues, logs or build
