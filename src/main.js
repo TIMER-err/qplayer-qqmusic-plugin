@@ -561,9 +561,125 @@ function squareDto(entry) {
   };
 }
 
-function home(args) {
-  var limit = Number(args.limit || 12);
+function findDailyCard(cards) {
+  for (var i = 0; i < (cards || []).length; i++) {
+    var card = cards[i] || {};
+    var title = String(card.title || "");
+    var id = String(card.id || "");
+    if (id && (title.indexOf("每日") >= 0 || title.indexOf("30首") >= 0)) return id;
+  }
+  return "";
+}
+
+function findDailyTid(body) {
+  var data = body.feed && body.feed.data || {};
+  var shelves = data.v_shelf || [];
+  for (var i = 0; i < shelves.length; i++) {
+    var shelf = shelves[i] || {};
+    var direct = findDailyCard(shelf.v_card || []);
+    if (direct) return direct;
+    var niches = shelf.v_niche || [];
+    for (var j = 0; j < niches.length; j++) {
+      var found = findDailyCard((niches[j] || {}).v_card || []);
+      if (found) return found;
+    }
+  }
+  return "";
+}
+
+/** 未登录时的推荐兜底：热歌榜。 */
+function hotSongs(limit) {
+  var count = Math.min(100, Math.max(1, Number(limit || 30)));
+  var url = SEARCH_HOST + "/v8/fcg-bin/fcg_v8_toplist_cp.fcg?topid=26&page=detail&type=top"
+    + "&song_begin=0&song_num=" + count
+    + "&format=json&inCharset=utf-8&outCharset=utf-8&notice=0&platform=yqq.json&needNewCode=1";
+  return httpGetJson(url, REF_BASE, UA_PC).then(function (body) {
+    var rows = body.songlist || [];
+    return songsOf(rows.map(function (row) { return row.data || row; })).slice(0, count);
+  }, function () { return []; });
+}
+
+/** 雷达/猜你喜欢，每页 5 首，逐页补足。 */
+function radarSongs(limit) {
+  limit = Math.min(100, Math.max(1, Number(limit || 30)));
   return requireUin().then(function (uin) {
+    if (!uin) return [];
+    var out = [];
+    var seen = {};
+    function loadPage(page) {
+      return musicu({
+        radar: {
+          module: "music.recommend.TrackRelationServer",
+          method: "GetRadarSong",
+          param: { LastToastTime: Date.now(), NeedNum: 149, Page: page, ReqType: 0 }
+        }
+      }).then(function (body) {
+        var node = body.radar || {};
+        if (Number(node.code || 0) !== 0) return false;
+        var rows = (node.data || {}).VecSongs || [];
+        if (!rows.length) return false;
+        var added = 0;
+        for (var i = 0; i < rows.length; i++) {
+          var track = (rows[i] || {}).Track || (rows[i] || {}).track || rows[i];
+          var dto = songDto(track);
+          if (dto.id && !seen[dto.id]) {
+            seen[dto.id] = true;
+            out.push(dto);
+            added++;
+          }
+        }
+        if (out.length >= limit || !added || page >= 10) return false;
+        return loadPage(page + 1);
+      }, function () { return false; });
+    }
+    return loadPage(1).then(function () { return out.slice(0, limit); });
+  });
+}
+
+function recommendedSongs(limit) {
+  return requireUin().then(function (uin) {
+    if (!uin) return hotSongs(limit);
+    return radarSongs(limit).then(function (songs) {
+      return songs.length ? songs : hotSongs(limit);
+    });
+  }, function () { return hotSongs(limit); });
+}
+
+/** 每日 30 首：推荐流中的「每日30首」卡片指向一个歌单。 */
+function dailyRecommendSongs(limit) {
+  limit = Math.min(500, Math.max(1, Number(limit || 30)));
+  return requireUin().then(function (uin) {
+    if (!uin) return hotSongs(Math.min(limit, 30));
+    return musicu({
+      feed: {
+        module: "music.recommend.RecommendFeed",
+        method: "get_recommend_feed",
+        param: { direction: 0, page: 1, v_cache: [], v_uniq: [], s_num: 0 }
+      }
+    }).then(function (body) {
+      var tid = findDailyTid(body);
+      if (!tid) throw new Error("未找到每日推荐");
+      return dissPage(tid, 0, Math.min(500, limit)).then(function (data) {
+        var songs = songsOf(data.songlist).slice(0, limit);
+        return songs.length ? songs : hotSongs(Math.min(limit, 30));
+      });
+    }).catch(function () {
+      return recommendedSongs(limit).then(function (songs) {
+        return songs.length ? songs : hotSongs(Math.min(limit, 30));
+      });
+    });
+  }, function () {
+    return hotSongs(Math.min(limit, 30));
+  });
+}
+
+function home(args) {
+  // ABI 1.0 的第二个首页入口：每日推荐页期望直接拿到歌曲数组。
+  if (args && args.operation === "recommendSongs") {
+    return dailyRecommendSongs(30);
+  }
+  var limit = Math.min(100, Math.max(1, Number(args && args.limit || 12)));
+  var playlists = requireUin().then(function (uin) {
     if (!uin) return null;
     // 未登录时这个模块直接回 1101,所以只在有登录态时用。
     return musicu({
@@ -581,7 +697,7 @@ function home(args) {
       return list.length ? list : null;
     }, function () { return null; });
   }).then(function (square) {
-    if (square) return { songs: [], playlists: square.slice(0, limit) };
+    if (square) return square.slice(0, limit);
     // 退回匿名可用的热门推荐。它不带歌曲数,宿主会显示为「暂无歌曲」,只在
     // 未登录或广场接口异常时才走到这里。
     return musicu({
@@ -592,9 +708,14 @@ function home(args) {
       }
     }).then(function (body) {
       var data = body.recomPlaylist && body.recomPlaylist.data || {};
-      var list = (data.v_hot || []).map(playlistDto);
-      return { songs: [], playlists: list.slice(0, limit) };
+      return (data.v_hot || []).map(playlistDto).slice(0, limit);
     });
+  });
+  return Promise.all([
+    playlists.catch(function () { return []; }),
+    recommendedSongs(30).catch(function () { return []; })
+  ]).then(function (both) {
+    return { songs: both[1], playlists: both[0] };
   });
 }
 
