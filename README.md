@@ -17,8 +17,8 @@ QPlayer 核心之外。
 | `songDetails` | 按 songmid 获取详情 |
 | `playlistDetails` | 歌单详情与曲目，分页拉取，私密歌单需登录 |
 | `artistDetails` / `albumDetails` | 歌手与专辑详情 |
-| `home` | 首页推荐歌单与推荐歌曲；登录后使用 `PlaylistSquare/GetRecommendFeed` 和雷达/猜你喜欢 |
-| `home({operation:"recommendSongs"})` | 每日 30 首：读取推荐流中的「每日30首」卡片对应歌单 |
+| `home` | 首页雷达/猜你喜欢歌曲与推荐歌单（含「每日30首」歌单卡片） |
+| `home({operation:"recommendSongs"})` | 雷达/猜你喜欢歌曲列表；未登录回退热歌榜 |
 | `userPlaylists` | 自建歌单（含「我喜欢」）与收藏的歌单 |
 | `like` | 「我喜欢」的读取与增删 |
 | `playlistMutation` | 新建/删除歌单、增删歌曲、收藏/取消收藏歌单 |
@@ -26,7 +26,7 @@ QPlayer 核心之外。
 | `lyrics` | 明文 LRC，匿名可用 |
 | `login` / `account` | QQ 扫码、网页登录（QQ/微信）、粘贴 Cookie |
 
-未登录时首页回退到热歌榜与热门歌单；每日 30 首和个性化推荐需要登录 QQ 音乐。
+未登录时首页回退到热歌榜与热门歌单；每日 30 首以首页歌单卡片提供，和个性化推荐都需要登录 QQ 音乐。
 
 设置页还提供插件自有的**音源解锁**开关：官方无版权或需要会员时换源。右键「缓存歌曲」
 走同一条解锁直链，任意 QQ 曲目都能下到 QPlayer 缓存。该入口由插件声明、QPlayer 渲染。

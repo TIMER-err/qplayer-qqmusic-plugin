@@ -18,8 +18,8 @@ responsible for complying with the service terms and local law.
 | `songDetails` | details by songmid |
 | `playlistDetails` | playlist details and tracks, paged; private playlists need login |
 | `artistDetails` / `albumDetails` | artist and album details |
-| `home` | recommended playlists and songs; uses `PlaylistSquare/GetRecommendFeed` and radar recommendations when signed in |
-| `home({operation:"recommendSongs"})` | Daily 30: reads the playlist behind the "每日30首" feed card |
+| `home` | radar/personalised songs and recommended playlists, including a "每日30首" playlist card |
+| `home({operation:"recommendSongs"})` | radar/personalised song list; falls back to the hot chart when signed out |
 | `userPlaylists` | own playlists (including Favourites) and followed playlists |
 | `like` | read and update the Favourites list |
 | `playlistMutation` | create/delete playlists, add/remove songs, follow/unfollow |
@@ -27,8 +27,9 @@ responsible for complying with the service terms and local law.
 | `lyrics` | plain LRC, works anonymously |
 | `login` / `account` | QQ QR sign-in, web login (QQ/WeChat), pasted cookie |
 
-Without login the home page falls back to the hot chart and hot playlists; Daily 30
-and personalised recommendations require a QQ Music session.
+Without login the home page falls back to the hot chart and hot playlists; Daily 30 is
+available as a home playlist card, and personalised recommendations require a QQ Music
+session.
 
 The settings page also carries a plugin-owned **source unlock** switch: when a track
 is unplayable or VIP-only on QQ Music, it matches a full stream from another source.
